@@ -27,3 +27,5 @@ For solo work, direct commits to `main` are acceptable. If multiple efforts run 
 ## Docs
 
 - `docs/mooncake-analysis.md`: persisted analysis of the `Mooncake` repository architecture, `Transfer Engine`, and `MasterService`
+- `docs/mooncake-transfer-paths.md`: finer-grained `Client::Put/Get -> TransferSubmitter -> Transfer Engine` sequence analysis
+- `docs/mooncake-masterservice-structures.md`: `MasterService` internal state container analysis

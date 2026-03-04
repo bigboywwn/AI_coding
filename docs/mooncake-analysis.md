@@ -288,3 +288,8 @@ Natural next analysis tasks:
 1. Draw a finer-grained sequence diagram for `Client::Put/Get -> TransferSubmitter -> Transfer Engine`.
 2. Map `MasterService` internal data structures such as metadata shards, processing keys, task queues, and discarded replicas.
 3. Evaluate which subset of Mooncake can be built or tested locally versus requiring a Linux server.
+
+## Related Docs
+
+- `docs/mooncake-transfer-paths.md`: detailed `Client::Put/Get -> TransferSubmitter -> Transfer Engine` path analysis
+- `docs/mooncake-masterservice-structures.md`: `MasterService` state container and lifecycle analysis
