@@ -20,6 +20,10 @@
 
 - Default branch: `main`
 - Default remote: `origin`
-- Remote URL: `https://github.com/bigboywwn/AI_coding.git`
+- Remote URL: `git@github.com:bigboywwn/AI_coding.git`
 
 For solo work, direct commits to `main` are acceptable. If multiple efforts run in parallel later, short-lived feature branches can be introduced.
+
+## Docs
+
+- `docs/mooncake-analysis.md`: persisted analysis of the `Mooncake` repository architecture, `Transfer Engine`, and `MasterService`
