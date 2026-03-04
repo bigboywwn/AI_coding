@@ -26,6 +26,6 @@ For solo work, direct commits to `main` are acceptable. If multiple efforts run 
 
 ## Docs
 
-- `docs/mooncake-analysis.md`: persisted analysis of the `Mooncake` repository architecture, `Transfer Engine`, and `MasterService`
-- `docs/mooncake-transfer-paths.md`: finer-grained `Client::Put/Get -> TransferSubmitter -> Transfer Engine` sequence analysis
-- `docs/mooncake-masterservice-structures.md`: `MasterService` internal state container analysis
+- `docs/mooncake-analysis.md`: `Mooncake` 仓库架构、`Transfer Engine` 和 `MasterService` 的总览分析
+- `docs/mooncake-transfer-paths.md`: `Client::Put/Get -> TransferSubmitter -> Transfer Engine` 的细粒度路径分析
+- `docs/mooncake-masterservice-structures.md`: `MasterService` 内部状态容器和生命周期分析

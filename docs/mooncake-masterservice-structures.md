@@ -1,42 +1,42 @@
-# Mooncake MasterService Data Structures
+# Mooncake `MasterService` 数据结构分析
 
-Analysis date: 2026-03-04
+分析日期：`2026-03-04`
 
-Source repository:
+源码来源：
 
-- URL: `https://github.com/kvcache-ai/Mooncake`
-- Local checkout: `/Users/miaomili/Documents/Playground/Mooncake`
-- Branch: `main`
-- Commit: `a402dc7`
+- 仓库地址：`https://github.com/kvcache-ai/Mooncake`
+- 本地路径：`/Users/miaomili/Documents/Playground/Mooncake`
+- 分支：`main`
+- 提交：`a402dc7`
 
-## Scope
+## 范围
 
-This note focuses on the internal state containers of `MasterService` and how they interact during:
+这份文档聚焦 `MasterService` 的内部状态容器，以及这些容器在下面几条路径里的关系：
 
 - `PutStart` / `PutEnd`
 - `CopyStart` / `CopyEnd`
 - `MoveStart` / `MoveEnd`
-- eviction and stale cleanup
-- snapshot and restore
+- eviction 和 stale cleanup
+- snapshot 和 restore
 
-It complements `docs/mooncake-analysis.md`.
+它是 `docs/mooncake-analysis.md` 的补充文档。
 
-## Locking Model
+## 锁模型
 
-The header documents a lock order:
+头文件里明确写了锁顺序：
 
 1. `client_mutex_`
 2. `metadata_shards_[shard_idx].mutex`
 3. `segment_mutex_`
 
-There is also a repository-wide `snapshot_mutex_` that gates snapshot consistency and restore.
+除此之外，还有一个全局的 `snapshot_mutex_`，用于 snapshot 一致性和 restore 协调。
 
-Practical implication:
+这意味着：
 
-- most object lifecycle logic is shard-local
-- snapshot adds a global coordination point around persistence
+- 大部分对象生命周期逻辑是 shard-local 的
+- snapshot 路径会额外引入全局协调点
 
-## Top-Level State Map
+## 顶层状态图
 
 ```mermaid
 flowchart TD
@@ -51,38 +51,38 @@ flowchart TD
   B --> J["replication_tasks"]
 ```
 
-The design separates state by purpose:
+从职责上可以把它们分成几类：
 
-- object lifecycle state lives in shard-local structures
-- delayed free state lives in `discarded_replicas_`
-- cross-client background work lives in `task_manager_`
-- physical capacity and handles live in `segment_manager_`
+- shard 内部状态：对象生命周期主状态
+- `discarded_replicas_`：延迟释放队列
+- `task_manager_`：面向 client 的任务分发和完成跟踪
+- `segment_manager_`：物理容量、segment 和 allocator 状态
 
 ## `metadata_shards_`
 
-`MasterService` uses `1024` metadata shards.
+`MasterService` 一共维护 `1024` 个 metadata shard。
 
-Each `MetadataShard` contains:
+每个 `MetadataShard` 里有三块核心状态：
 
-- `metadata`: `key -> ObjectMetadata`
-- `processing_keys`: keys still in incomplete `PutStart` state
-- `replication_tasks`: keys with active copy or move work
+- `metadata`：`key -> ObjectMetadata`
+- `processing_keys`：处于未完成 `PutStart` 阶段的 key
+- `replication_tasks`：正在执行 copy / move 的 key
 
-Why this matters:
+这层设计的意义很直接：
 
-- read/write contention is spread across shards by key hash
-- the store tracks object existence, incomplete writes, and background replication separately
+- 用 key hash 做分片，降低读写锁竞争
+- 把“对象存在”“对象还在写入”“对象有后台复制任务”这三类状态区分开来
 
 ## `ObjectMetadata`
 
-`ObjectMetadata` is the main per-key state record. Its core fields are:
+`ObjectMetadata` 是单个 key 最核心的状态记录。核心字段包括：
 
-- `client_id`: owner of the original put
-- `put_start_time`: used for stale write cleanup
-- `size`: logical value size
-- `lease_timeout`: hard lease deadline
-- `soft_pin_timeout`: optional soft-retention deadline
-- `replicas_`: the actual replica list
+- `client_id`：最初发起 put 的 owner
+- `put_start_time`：用于清理过期写入
+- `size`：对象逻辑大小
+- `lease_timeout`：硬 lease 截止时间
+- `soft_pin_timeout`：可选的 soft retention 时间
+- `replicas_`：该对象当前持有的 replica 列表
 
 ```mermaid
 flowchart LR
@@ -94,197 +94,200 @@ flowchart LR
   A --> G["replicas_"]
 ```
 
-`ObjectMetadata` is not just passive storage. It also owns helper logic:
+`ObjectMetadata` 不是单纯的数据结构，它还内置了一批操作：
 
-- add or remove replicas
-- visit replicas by predicate
-- count or find replicas
-- grant leases
-- check lease expiry
-- check soft-pin status
-- validate whether the object still has at least one usable replica
+- 增加或删除 replica
+- 按 predicate 遍历 replica
+- 统计 replica
+- 查找特定 replica
+- 授予 lease
+- 判断 lease 是否过期
+- 判断 soft-pin 是否还有效
+- 判断对象是否仍然有至少一个有效 replica
 
-That makes it the central lifecycle state machine for each key.
+所以从设计角度看，它本身就是每个 key 的生命周期状态机。
 
-## Replica-Related State
+## replica 相关状态为什么集中在 `ObjectMetadata`
 
-The object does not split memory and disk state into separate top-level maps. Instead, all replica types coexist inside `ObjectMetadata.replicas_`.
+这里没有把 memory replica 和 disk replica 拆到不同的顶层 map，而是统一放在 `ObjectMetadata.replicas_` 里。
 
-Consequences:
+直接带来的结果是：
 
-- `PutEnd` can mark all memory replicas complete by iterating the same vector
-- disk eviction and memory eviction remove subsets of the same vector
-- `CopyStart` and `MoveStart` append newly allocated replicas into the same object record
+- `PutEnd` 可以直接在同一个 vector 上把 memory replica 标记为 complete
+- disk eviction 和 memory eviction 都是在同一个 replica 集合里删子集
+- `CopyStart` 和 `MoveStart` 会把新分配的目标 replica 追加到同一个对象记录里
 
-This keeps the key-level state compact, but it also means many operations mutate the same vector under the shard lock.
+优点是 key 级状态集中。代价是很多操作都要在 shard 锁下改同一个 replica vector。
 
 ## `processing_keys`
 
-`processing_keys` is the set of keys whose object creation is still incomplete.
+`processing_keys` 用来表示“对象已经进了 metadata，但创建流程还没完全结束”。
 
-Typical lifecycle:
+典型生命周期是：
 
-1. `PutStart` inserts metadata and also inserts the key into `processing_keys`
-2. `PutEnd` removes the key when all replicas are complete
-3. timeout cleanup scans `processing_keys` and discards stale processing replicas
+1. `PutStart` 写入 metadata，并把 key 插入 `processing_keys`
+2. `PutEnd` 在所有 replica 都 complete 后，把 key 从 `processing_keys` 移除
+3. timeout cleanup 会扫描 `processing_keys`，清理长时间未完成的 processing replica
 
-What it represents:
+它存在的意义是：
 
-- an object that exists in metadata but is not yet considered fully stable
+- 一个对象可以“存在”
+- 但仍然需要被单独监控，因为它还没完成
 
-This is why `processing_keys` is separate from `metadata`:
-
-- a key can exist, but still require timeout monitoring
+这就是为什么 `processing_keys` 不能被简单并入 `metadata`。
 
 ## `replication_tasks`
 
-`replication_tasks` stores active copy or move work keyed by object key.
+`replication_tasks` 存储 key 级别的 copy / move 进行中状态。
 
-Each `ReplicationTask` contains:
+每个 `ReplicationTask` 里包含：
 
 - `client_id`
 - `start_time`
-- `type`: `COPY` or `MOVE`
+- `type`：`COPY` 或 `MOVE`
 - `source_id`
-- `replica_ids`: allocated target replicas
+- `replica_ids`：这次任务新申请到的目标 replica ID 列表
 
-This map is the control-plane state for copy and move operations.
+这张表的角色是“对象级 copy / move 控制面状态”。
 
-Important behavior:
+它的典型行为是：
 
-- `CopyStart` or `MoveStart` inserts a task
-- source replica `refcnt` is incremented to make eviction unsafe while transfer is running
-- `CopyEnd` / `MoveEnd` mark target replicas complete and erase the task
-- revoke or timeout drops target replicas and clears the task
+- `CopyStart` 或 `MoveStart` 插入任务
+- source replica 的 `refcnt` 增加，防止任务进行时被 eviction
+- `CopyEnd` / `MoveEnd` 把目标 replica 标成 complete，并删除任务
+- revoke 或 timeout 会丢弃目标 replica 并清理任务
 
 ## `discarded_replicas_`
 
-`discarded_replicas_` is a delayed-release list protected by its own mutex.
+`discarded_replicas_` 是一个带独立 mutex 的延迟释放链表。
 
-It exists to hold replicas that should no longer be logically visible but should not be released immediately.
+它承载的是这样一类 replica：
 
-Typical producers:
+- 从逻辑上已经不应该再对外可见
+- 但暂时不立即释放物理资源
 
-- expired `PutStart` operations
-- expired copy or move tasks
-- `MoveEnd`, when the old source replica is retired after a successful move
+常见生产来源：
 
-Why it exists:
+- 过期的 `PutStart`
+- 过期的 copy / move 任务
+- `MoveEnd` 成功后被替换掉的旧 source replica
 
-- it records discard/release metrics
-- it decouples logical invalidation from physical memory release
-- it gives the system a safe delayed cleanup path
+这个结构存在的原因有三点：
+
+- 记录 discard / release 指标
+- 把逻辑失效和物理释放解耦
+- 提供一个更安全的延迟清理路径
 
 ```mermaid
 flowchart TD
-  A["Expired or replaced replica"] --> B["discarded_replicas_"]
-  B --> C["TTL expires"]
+  A["过期或被替换的 replica"] --> B["discarded_replicas_"]
+  B --> C["TTL 到期"]
   C --> D["ReleaseExpiredDiscardedReplicas()"]
-  D --> E["physical release by destructor / container removal"]
+  D --> E["通过容器移除 / 析构触发物理释放"]
 ```
 
 ## `task_manager_`
 
-`task_manager_` is distinct from `replication_tasks`.
+`task_manager_` 和 `replication_tasks` 不是同一层东西。
 
-Difference in role:
+区别在于：
 
-- `replication_tasks`: object-local copy/move state stored inside the metadata shard
-- `task_manager_`: client task distribution and completion tracking for higher-level scheduled work
+- `replication_tasks`：存储在 metadata shard 里的对象级 copy / move 状态
+- `task_manager_`：更上层的 client task 分发、查询和完成跟踪
 
-This distinction matters because otherwise the names are easy to confuse. One is shard-local object state, the other is a broader work queue and assignment subsystem.
+这两个名字很容易混，但职责完全不同。前者是对象局部状态，后者更像跨 client 的任务系统。
 
 ## `segment_manager_`
 
-`segment_manager_` is not object metadata, but it is tightly coupled to lifecycle changes.
+`segment_manager_` 虽然不直接存 object metadata，但和生命周期路径高度耦合。
 
-It provides:
+它提供的核心能力包括：
 
 - allocator access
-- segment mount/unmount state
+- segment mount / unmount 状态
 - local disk segment access
-- the physical capacity layer used by allocation strategy and offload plumbing
+- allocation strategy 和 offload 所需的物理容量信息
 
-`PutStart`, `CopyStart`, and `MoveStart` all cross into allocator state through `segment_manager_`.
+`PutStart`、`CopyStart`、`MoveStart` 都会通过 `segment_manager_` 进入 allocator 状态。
 
-## Accessor Types
+## accessor 类型为什么重要
 
-The code wraps shard access in helper types:
+代码里没有直接到处手写“算 shard index + 上锁 + 查 map”，而是封装了几类 accessor：
 
 - `MetadataShardAccessorRW`
 - `MetadataShardAccessorRO`
 - `MetadataAccessorRW`
 - `MetadataAccessorRO`
 
-These helpers matter because they bundle:
+这些 accessor 统一处理：
 
-- shard lookup by hashed key
-- lock acquisition
-- lookup of `metadata`
-- lookup of `processing_keys`
-- lookup of `replication_tasks`
-- stale-handle cleanup on mutable access
+- 按 key hash 定位 shard
+- 获取锁
+- 读取 `metadata`
+- 读取 `processing_keys`
+- 读取 `replication_tasks`
+- 在可写路径上顺带做 stale-handle cleanup
 
-This is a meaningful design choice: the code tries to make “open a key for mutation” a higher-level operation than raw map access.
+这是个重要的工程设计点：代码在试图把“打开一个 key 进行安全修改”提升成一个高层动作，而不是裸 map 操作。
 
-## How the Structures Interact
+## 这些结构如何协同
 
 ### `PutStart`
 
 ```mermaid
 flowchart TD
   A["PutStart(key)"] --> B["metadata_shards_[hash(key)]"]
-  B --> C["check metadata[key]"]
-  C --> D["discard stale incomplete state if needed"]
-  D --> E["allocation_strategy via segment_manager_"]
-  E --> F["create replicas"]
+  B --> C["检查 metadata[key]"]
+  C --> D["必要时丢弃陈旧未完成状态"]
+  D --> E["通过 segment_manager_ 和 allocation_strategy 分配 replica"]
+  E --> F["创建 replicas"]
   F --> G["metadata[key] = ObjectMetadata(...)"]
   G --> H["processing_keys.insert(key)"]
 ```
 
-State effect:
+这一步带来的状态变化是：
 
-- create `ObjectMetadata`
-- add processing marker
-- optionally enqueue stale earlier replicas into `discarded_replicas_`
+- 创建 `ObjectMetadata`
+- 增加 processing 标记
+- 如果有陈旧旧状态，可能把旧 replica 放进 `discarded_replicas_`
 
 ### `PutEnd`
 
 ```mermaid
 flowchart TD
   A["PutEnd(key, replica_type)"] --> B["metadata[key]"]
-  B --> C["mark matching replicas complete"]
-  C --> D["optional PushOffloadingQueue"]
-  D --> E{"all replicas complete?"}
-  E -->|yes| F["processing_keys.erase(key)"]
-  E -->|no| G["keep key in processing_keys"]
+  B --> C["把匹配类型的 replica 标记为 complete"]
+  C --> D["按需 PushOffloadingQueue"]
+  D --> E{"所有 replica 都 complete 了吗？"}
+  E -->|是| F["processing_keys.erase(key)"]
+  E -->|否| G["继续保留在 processing_keys"]
   F --> H["GrantLease(0, soft_pin_ttl)"]
   G --> H
 ```
 
-State effect:
+这一步的状态变化是：
 
-- transition replica status inside `ObjectMetadata`
-- possibly remove the processing marker
-- initialize lease / soft-pin timing for completed object
+- 更新 `ObjectMetadata` 内部 replica 状态
+- 在全完成时移除 processing 标记
+- 初始化对象完成后的 lease / soft-pin 时间
 
 ### `CopyStart`
 
 ```mermaid
 flowchart TD
   A["CopyStart(key)"] --> B["metadata[key]"]
-  B --> C["validate source replica"]
-  C --> D["allocate target replicas via segment_manager_"]
+  B --> C["校验 source replica"]
+  C --> D["通过 segment_manager_ 分配目标 replica"]
   D --> E["replication_tasks[key] = ReplicationTask(COPY, ...)"]
   E --> F["source.refcnt++"]
   F --> G["metadata.AddReplicas(targets)"]
 ```
 
-State effect:
+这里最关键的状态变化是：
 
-- object remains the same logical key
-- target replicas are appended before transfer completes
-- replication task records which new replica IDs belong to the in-flight copy
+- 对象逻辑上还是同一个 key
+- 目标 replica 会先被加进对象状态，再等待数据真正传过去
+- `replication_tasks` 记录本次 copy 新增的 replica IDs
 
 ### `MoveEnd`
 
@@ -292,79 +295,80 @@ State effect:
 flowchart TD
   A["MoveEnd(key)"] --> B["replication_tasks[key]"]
   B --> C["source.refcnt--"]
-  C --> D["mark target complete if new target exists"]
+  C --> D["如果存在新目标，则标记 target complete"]
   D --> E["PopReplicas(source_id)"]
-  E --> F["push old source into discarded_replicas_"]
-  F --> G["erase replication_tasks[key]"]
+  E --> F["把旧 source 放入 discarded_replicas_"]
+  F --> G["删除 replication_tasks[key]"]
 ```
 
-State effect:
+这一步带来的效果是：
 
-- the object migrates to a new replica set
-- the old source is not immediately freed; it enters delayed discard
+- 对象完成迁移到新的 replica 集合
+- 旧 source 不会立刻释放，而是进入延迟 discard 阶段
 
-## Eviction and Cleanup
+## eviction 与 cleanup 如何作用在这些结构上
 
-Two different cleanup paths operate on different containers.
+这里实际上有两类清理路径，而且它们作用的容器不同。
 
-### Lease-driven eviction
+### lease 驱动的 eviction
 
-`BatchEvict(...)` focuses on objects that:
+`BatchEvict(...)` 主要关注这些对象：
 
-- have expired lease
-- have memory replicas
-- have `refcnt == 0`
+- lease 已过期
+- 持有 memory replica
+- `refcnt == 0`
 
-This path mainly mutates `ObjectMetadata.replicas_`.
+这条路径主要修改的是 `ObjectMetadata.replicas_`。
 
-### Timeout cleanup
+### timeout 驱动的 cleanup
 
-`DiscardExpiredProcessingReplicas(...)` scans:
+`DiscardExpiredProcessingReplicas(...)` 会扫描：
 
 - `processing_keys`
 - `replication_tasks`
 
-and moves abandoned replicas into `discarded_replicas_`.
+然后把被放弃的 replica 移进 `discarded_replicas_`。
 
-This is the path that cleans up unfinished `PutStart`, `CopyStart`, and `MoveStart`.
+这条路径负责清理未完成的 `PutStart`、`CopyStart` 和 `MoveStart`。
 
-## Snapshot and Restore Impact
+## snapshot / restore 对状态结构的要求
 
-Snapshot serialization persists more than just object metadata.
+snapshot 持久化的内容不只是 object metadata。
 
-Persisted logical state includes:
+核心持久化状态包括：
 
 - shard metadata
-- discarded replicas
+- `discarded_replicas_`
 - segments
-- task manager state
+- `task_manager_`
 
-This is important because restore must reconstruct both:
+这件事很重要，因为 restore 不只是要恢复“有哪些对象和 replica”，还要恢复：
 
-- what objects and replicas exist
-- what deferred cleanup or scheduled work still exists
+- 哪些延迟释放状态还在
+- 哪些任务系统状态还在
 
-Practical takeaway:
+换句话说：
 
-- `metadata_shards_` alone is not enough to restore the master correctly
-- `discarded_replicas_` and `task_manager_` are first-class persisted state
+- 只恢复 `metadata_shards_` 并不足以正确恢复 master
+- `discarded_replicas_` 和 `task_manager_` 也是一等持久化状态
 
-## Design Assessment
+## 设计判断
 
-The strongest part of the design is that object state is grouped by key and shard, while delayed release and distributed task assignment are pulled into separate containers.
+这套设计最强的地方在于：
 
-The main complexity comes from the number of partially overlapping lifecycle states:
+- 对象状态按 key 和 shard 聚合
+- 延迟释放和任务系统又被拆到独立容器里
 
-- object exists in `metadata`
-- object is also in `processing_keys`
-- object also has `replication_tasks`
-- some of its old replicas may already live in `discarded_replicas_`
+最复杂的地方在于多个生命周期状态会同时叠加：
 
-That overlap is manageable, but it explains why `MasterService` is the hardest part of the repository to modify safely.
+- 对象存在于 `metadata`
+- 同时还在 `processing_keys`
+- 还可能在 `replication_tasks` 中有进行中的 copy / move
+- 某些旧 replica 又已经进入 `discarded_replicas_`
 
-## Where to Read Next
+这种重叠并不是错误，但它解释了为什么 `MasterService` 是全仓库最难安全修改的部分。
 
-If the goal is to change internals safely, the most useful files are:
+## 如果继续深入，建议接着看
 
 1. `mooncake-store/include/master_service.h`
 2. `mooncake-store/src/master_service.cpp`

@@ -1,51 +1,51 @@
-# Mooncake Transfer Paths
+# Mooncake 传输路径分析
 
-Analysis date: 2026-03-04
+分析日期：`2026-03-04`
 
-Source repository:
+源码来源：
 
-- URL: `https://github.com/kvcache-ai/Mooncake`
-- Local checkout: `/Users/miaomili/Documents/Playground/Mooncake`
-- Branch: `main`
-- Commit: `a402dc7`
+- 仓库地址：`https://github.com/kvcache-ai/Mooncake`
+- 本地路径：`/Users/miaomili/Documents/Playground/Mooncake`
+- 分支：`main`
+- 提交：`a402dc7`
 
-## Scope
+## 范围
 
-This note focuses on the client-side data path:
+这份文档只关注客户端侧的数据路径，主要包括：
 
 - `Client::Create`
 - `Client::Get`
 - `Client::Put`
 - `TransferSubmitter`
-- `TransferFuture` and `OperationState`
-- `Transfer Engine` and `MultiTransport`
+- `TransferFuture` 与 `OperationState`
+- `Transfer Engine` 与 `MultiTransport`
 
-It is a finer-grained companion to `docs/mooncake-analysis.md`.
+它是 `docs/mooncake-analysis.md` 的细化版。
 
-## Main Actors
+## 主要参与者
 
-- `Client`: orchestrates RPC with master and drives local reads and writes
-- `MasterClient`: returns replica descriptors and finalizes object lifecycle
-- `TransferSubmitter`: chooses between memcpy, transfer engine, or file read
-- `TransferFuture`: async completion wrapper
-- `TransferEngine`: facade around segment resolution, batching, and transport submission
-- `MultiTransport`: groups requests by transport and dispatches them to concrete backends
+- `Client`：负责和 master 的 RPC 交互，并驱动本地读写流程
+- `MasterClient`：负责返回 replica descriptor，并完成对象生命周期上的确认操作
+- `TransferSubmitter`：在 memcpy、`Transfer Engine` 和 file read 三种路径之间做选择
+- `TransferFuture`：统一的异步完成态包装
+- `TransferEngine`：负责 segment 解析、batch 提交和 transport 层入口
+- `MultiTransport`：按 transport 对请求分组并分发到具体后端
 
-## Startup Path
+## 初始化路径
 
-`Client::Create` is the setup sequence that makes later transfer calls possible.
+`Client::Create` 是后续所有传输路径的准备阶段。
 
-Observed flow:
+可以把流程理解成：
 
-1. connect to master
-2. fetch storage config and optionally initialize `StorageBackend`
-3. initialize or reuse `TransferEngine`
-4. initialize `TransferSubmitter`
-5. initialize local hot cache
+1. 连接 master
+2. 拉取 storage config，必要时初始化 `StorageBackend`
+3. 初始化或复用 `TransferEngine`
+4. 初始化 `TransferSubmitter`
+5. 初始化 local hot cache
 
 ```mermaid
 sequenceDiagram
-  participant U as "Caller"
+  participant U as "调用方"
   participant C as "Client"
   participant M as "Master"
   participant SB as "StorageBackend"
@@ -55,31 +55,31 @@ sequenceDiagram
   U->>C: "Client::Create(...)"
   C->>M: "ConnectToMaster(master_server_entry)"
   C->>M: "GetStorageConfig()"
-  alt "fsdir is configured"
+  alt "配置了 fsdir"
     C->>SB: "PrepareStorageBackend(...)"
   end
   alt "transfer_engine == nullptr"
     C->>TE: "InitTransferEngine(...)"
-  else "existing engine provided"
-    C->>TE: "reuse existing instance"
+  else "外部传入已有实例"
+    C->>TE: "复用 existing engine"
   end
   C->>TS: "InitTransferSubmitter()"
   C->>C: "InitLocalHotCache()"
 ```
 
-Practical implication:
+这里最重要的结论是：
 
-- storage is optional
-- transport is optional only in `rpc_only` mode
-- `TransferSubmitter` is the last component that turns replica descriptors into movement operations
+- storage backend 是可选的
+- 只有 `rpc_only` 模式才会跳过 transport 初始化
+- 真正把 replica descriptor 转成“数据搬运动作”的对象是 `TransferSubmitter`
 
-## Read Path: `Client::Get`
+## 读路径：`Client::Get`
 
-### High-level sequence
+### 高层时序
 
 ```mermaid
 sequenceDiagram
-  participant U as "Caller"
+  participant U as "调用方"
   participant C as "Client"
   participant M as "Master"
   participant HC as "Hot Cache"
@@ -92,7 +92,7 @@ sequenceDiagram
   C->>M: "GetReplicaList(key)"
   M-->>C: "replicas + lease_ttl"
   C->>C: "FindFirstCompleteReplica(...)"
-  alt "local hot cache hit"
+  alt "命中 local hot cache"
     C->>HC: "RedirectToHotCache(key, replica)"
   end
   C->>TS: "submit(replica, slices, READ)"
@@ -101,7 +101,7 @@ sequenceDiagram
     TS-->>C: "TransferFuture(MemcpyOperationState)"
   else "TRANSFER_ENGINE"
     TS->>TE: "openSegment(endpoint)"
-    TE->>TE: "resolve SegmentID via metadata"
+    TE->>TE: "通过 metadata 解析 SegmentID"
     TS->>TE: "allocateBatchID()"
     TS->>TE: "submitTransfer(batch_id, requests)"
     TE->>MT: "submitTransfer(batch_id, requests)"
@@ -111,36 +111,36 @@ sequenceDiagram
     TS-->>C: "TransferFuture(FilereadOperationState)"
   end
   C->>C: "future.get()"
-  C->>HC: "release/update hot cache"
-  C->>C: "lease expiry check"
-  C-->>U: "OK or error"
+  C->>HC: "释放 / 更新 hot cache"
+  C->>C: "lease 过期检查"
+  C-->>U: "OK 或 error"
 ```
 
-### Step-by-step behavior
+### 逐步展开
 
-1. `Client::Get(key, slices)` first calls `Query(key)`.
-2. `Query(key)` asks the master for completed replicas and a lease TTL.
-3. `Client::Get(key, query_result, slices)` picks the first complete replica.
-4. If the replica is in memory, the client may redirect to local hot cache.
-5. `TransferRead()` forwards to `TransferData(..., READ)`.
-6. `TransferData()` calls `transfer_submitter_->submit(...)`.
-7. The future is waited synchronously through `future->get()`.
-8. After data transfer completes, hot cache bookkeeping runs.
-9. The client checks whether the read finished after the lease expired.
+1. `Client::Get(key, slices)` 先调用 `Query(key)`。
+2. `Query(key)` 向 master 获取已完成的 replica 列表和 lease TTL。
+3. `Client::Get(key, query_result, slices)` 再挑选第一个 complete replica。
+4. 如果 replica 在内存中，客户端可能先尝试重定向到 local hot cache。
+5. `TransferRead()` 会转到 `TransferData(..., READ)`。
+6. `TransferData()` 再调用 `transfer_submitter_->submit(...)`。
+7. 客户端通过 `future->get()` 同步等待结果。
+8. 传输完成后再做 hot cache 的释放和异步回填。
+9. 最后检查 lease 是否在数据搬运完成前已经过期。
 
-### Important behavior
+### 这条路径里最容易忽略的点
 
-- lease is granted by the master at query time, not after the bytes move
-- the client checks lease expiry after the transfer finishes
-- hot cache is treated as an optimization layer that rewrites the replica descriptor to a local address
+- lease 是在 query 阶段由 master 授予的，不是在字节传输完成后授予
+- 客户端是在传输结束后才检查 lease 是否过期
+- hot cache 的本质是把 replica descriptor 重写成本地地址，从而把远程读路径短路成本地访问
 
-## Write Path: `Client::Put`
+## 写路径：`Client::Put`
 
-### High-level sequence
+### 高层时序
 
 ```mermaid
 sequenceDiagram
-  participant U as "Caller"
+  participant U as "调用方"
   participant C as "Client"
   participant M as "Master"
   participant SB as "StorageBackend"
@@ -152,11 +152,11 @@ sequenceDiagram
   U->>C: "Put(key, slices, config)"
   C->>M: "PutStart(key, slice_lengths, config)"
   M-->>C: "target replica descriptors"
-  alt "disk replica exists"
+  alt "存在 disk replica"
     C->>SB: "PutToLocalFile(key, slices, disk_descriptor)"
-    C->>M: "async PutEnd(key, DISK) after storage succeeds"
+    C->>M: "存储成功后异步 PutEnd(key, DISK)"
   end
-  loop "for each memory replica"
+  loop "每个 memory replica"
     C->>TS: "submit(replica, slices, WRITE)"
     TS->>TS: "selectStrategy(handle, slices)"
     alt "LOCAL_MEMCPY"
@@ -170,90 +170,90 @@ sequenceDiagram
     end
     C->>C: "future.get()"
   end
-  alt "any memory transfer fails"
+  alt "任一 memory transfer 失败"
     C->>M: "PutRevoke(key, MEMORY)"
-  else "all memory transfers succeed"
+  else "全部 memory transfer 成功"
     C->>M: "PutEnd(key, MEMORY)"
   end
-  C-->>U: "OK or error"
+  C-->>U: "OK 或 error"
 ```
 
-### Step-by-step behavior
+### 逐步展开
 
-1. `Put()` computes slice lengths and may force a preferred segment under `cxl`.
-2. `PutStart()` asks the master to allocate target replicas.
-3. If a disk replica is present and `StorageBackend` exists, the client persists that copy first.
-4. Disk completion is finalized asynchronously by the client-side write thread after the backend store succeeds.
-5. Each memory replica is written through `TransferWrite()`.
-6. `TransferWrite()` is just `TransferData(..., WRITE)`.
-7. Transfer failures trigger `PutRevoke(key, MEMORY)`.
-8. Successful completion triggers `PutEnd(key, MEMORY)`.
+1. `Put()` 会先整理 slice 长度，必要时在 `cxl` 模式下设置 preferred segment。
+2. `PutStart()` 向 master 申请目标 replica。
+3. 如果返回结果里包含 disk replica 且本地有 `StorageBackend`，客户端会先把磁盘副本写下去。
+4. disk replica 的完成确认是客户端写线程在 backend store 成功后异步通知 master 的。
+5. 每个 memory replica 再通过 `TransferWrite()` 写入。
+6. `TransferWrite()` 本质上就是 `TransferData(..., WRITE)`。
+7. 如果任何一次 memory transfer 失败，客户端会调用 `PutRevoke(key, MEMORY)`。
+8. 所有 memory transfer 都成功后，客户端再调用 `PutEnd(key, MEMORY)`。
 
-### Important behavior
+### 这条路径的几个关键点
 
-- the client writes disk replicas before memory finalization so disk-side revoke/end remains well-defined
-- memory replicas are transferred one replica at a time in `Put()`
-- master-side object visibility is finalized by `PutEnd`, not by the transfer itself
+- 客户端会先处理 disk replica，再完成 memory 路径的最终确认，这样 disk 相关的 revoke / end 语义更稳定
+- 在当前 `Put()` 实现里，memory replicas 是逐个写的，不是统一 batch 推送
+- 对象是否真正“完成可见”，是由 `PutEnd` 决定的，而不是由单次数据传输决定
 
-## `TransferSubmitter` Strategy Selection
+## `TransferSubmitter` 的策略选择
 
-The strategy split is explicit:
+这里的策略分支非常清楚：
 
 - `LOCAL_MEMCPY`
 - `TRANSFER_ENGINE`
 - `FILE_READ`
 
-Selection rules:
+基本规则可以概括成：
 
-1. disk replica always goes to `FILE_READ` for read path
-2. if `MC_STORE_MEMCPY` is disabled, memory replicas always use `TRANSFER_ENGINE`
-3. if `MC_STORE_MEMCPY` is enabled and source/target resolve to the same local IP, the path becomes `LOCAL_MEMCPY`
-4. otherwise use `TRANSFER_ENGINE`
+1. 如果目标是 disk replica，读路径会走 `FILE_READ`
+2. 如果 `MC_STORE_MEMCPY` 被关闭，memory replica 会统一走 `TRANSFER_ENGINE`
+3. 如果 `MC_STORE_MEMCPY` 开启，并且源 / 目标被判断为同一台本地机器，则会走 `LOCAL_MEMCPY`
+4. 其他情况走 `TRANSFER_ENGINE`
 
-This means the caller does not choose the transfer backend directly. The backend is derived from replica type, endpoint locality, and environment configuration.
+也就是说，调用方并不直接选择 transport backend。backend 是由 replica 类型、endpoint locality 和环境配置共同决定的。
 
-## `TransferSubmitter` Internals
+## `TransferSubmitter` 内部结构
 
 ### `submit(...)`
 
-`submit(...)` is the main branch point:
+`submit(...)` 是主要分支点，负责：
 
-- validate transfer size against handle size
-- inspect replica type
-- choose strategy
-- create a `TransferFuture`
-- update transfer metrics if submission succeeds
+- 校验 handle size 和 slices 总长度是否一致
+- 判断 replica 类型
+- 选择策略
+- 创建 `TransferFuture`
+- 在提交成功时更新传输指标
 
 ### `submitMemcpyOperation(...)`
 
-This path:
+这条路径会：
 
-- builds a vector of memcpy operations
-- maps READ and WRITE into different source/destination orientation
-- pushes the work into `MemcpyWorkerPool`
-- returns `TransferFuture(MemcpyOperationState)`
+- 构造 memcpy operation 列表
+- 根据 READ / WRITE 决定 source 和 destination 的方向
+- 把任务提交给 `MemcpyWorkerPool`
+- 返回 `TransferFuture(MemcpyOperationState)`
 
 ### `submitTransferEngineOperation(...)`
 
-This path:
+这条路径会：
 
-1. checks the remote transport endpoint
-2. resolves `SegmentHandle` via `engine_.openSegment(...)`
-3. builds one `TransferRequest` per slice
-4. calls `submitTransfer(requests)`
+1. 校验 transport endpoint
+2. 通过 `engine_.openSegment(...)` 解析 `SegmentHandle`
+3. 为每个 slice 构造 `TransferRequest`
+4. 调用 `submitTransfer(requests)`
 
 ### `submitTransfer(requests)`
 
-This is the narrow handoff into `Transfer Engine`:
+这是进入 `Transfer Engine` 的最窄入口：
 
-1. allocate batch ID
-2. call `engine_.submitTransfer(batch_id, requests)`
-3. wrap the batch in `TransferEngineOperationState`
-4. return `TransferFuture`
+1. 分配 batch ID
+2. 调用 `engine_.submitTransfer(batch_id, requests)`
+3. 用这个 batch 构造 `TransferEngineOperationState`
+4. 返回 `TransferFuture`
 
-## `TransferFuture` and Completion Model
+## `TransferFuture` 与完成态模型
 
-`TransferFuture` is a uniform wrapper over three different completion modes:
+`TransferFuture` 统一封装了三种不同的完成态：
 
 - `MemcpyOperationState`
 - `FilereadOperationState`
@@ -263,66 +263,64 @@ This is the narrow handoff into `Transfer Engine`:
 flowchart TD
   A["TransferFuture.get()"] --> B["OperationState.wait_for_completion()"]
   B --> C{"Strategy"}
-  C -->|"LOCAL_MEMCPY"| D["wait on cv_ until worker thread sets result"]
-  C -->|"FILE_READ"| E["wait on cv_ until file worker sets result"]
-  C -->|"TRANSFER_ENGINE"| F["poll task status or wait on BatchDesc completion"]
+  C -->|"LOCAL_MEMCPY"| D["等待 worker thread 通过 cv_ 回写结果"]
+  C -->|"FILE_READ"| E["等待 file worker 通过 cv_ 回写结果"]
+  C -->|"TRANSFER_ENGINE"| F["轮询 task 状态或等待 BatchDesc 完成"]
   F --> G["engine_.getTransferStatus(batch_id, task_id)"]
-  G --> H["all completed => OK; any failed => TRANSFER_FAIL"]
+  G --> H["全部完成 => OK；任一失败 => TRANSFER_FAIL"]
 ```
 
-Important behavior:
+这里的几个关键事实：
 
-- `TransferEngineOperationState` owns the batch ID lifetime and frees it in the destructor
-- event-driven completion is supported when compiled that way; otherwise the state polls transfer status
-- the client-facing API stays synchronous because `future.get()` is called inside `TransferData()`
+- `TransferEngineOperationState` 持有 batch ID 的生命周期，并在析构时释放
+- 如果编译启用了 event-driven completion，它会直接等 `BatchDesc`；否则就轮询 transfer status
+- 虽然中间对象是 future 语义，但客户端对外仍然表现为同步接口，因为 `TransferData()` 内部直接 `future.get()`
 
-## Transfer Engine Handoff
+## `Transfer Engine` 交接点
 
-The Transfer Engine part of the path is narrower than it first appears.
+真正进入 `Transfer Engine` 后，路径比名字看起来更窄。
 
 ### `openSegment(...)`
 
-For most protocols:
+对大多数协议来说，它做的主要是：
 
-- normalize segment name
-- look up `SegmentID` via transfer metadata
-- return that ID
+- 规范化 segment name
+- 通过 transfer metadata 查 `SegmentID`
+- 返回这个 `SegmentID`
 
-This is usually metadata resolution, not a socket-style connection.
+也就是说，这通常不是 socket 风格的“建立连接”，而是 metadata 解析。
 
 ### `MultiTransport::submitTransfer(...)`
 
-Once `engine_.submitTransfer(...)` reaches `MultiTransport`:
+当 `engine_.submitTransfer(...)` 进入 `MultiTransport` 后，内部流程是：
 
-1. each request is assigned a `TransferTask`
-2. each request is routed to a concrete transport by `selectTransport(...)`
-3. tasks are grouped by transport instance
-4. grouped task lists are submitted to each transport backend
+1. 给每个 request 绑定一个 `TransferTask`
+2. 用 `selectTransport(...)` 给 request 选择具体 transport
+3. 按 transport 对 task 分组
+4. 把分组后的 task list 提交到各自的 transport backend
 
-### Status propagation
+### 状态如何向上回传
 
-`MultiTransport` aggregates per-task slice completion into:
+`MultiTransport` 会把 slice 级完成态聚合成：
 
-- task-level status
-- batch-level status
+- task 级状态
+- batch 级状态
 
-That aggregated state is what `TransferEngineOperationState` observes when it waits.
+`TransferEngineOperationState` 等待的就是这个聚合结果。
 
-## End-to-End Mental Model
+## 一句话理解整条路径
 
-The simplest way to reason about the path is:
+最简单的心智模型是：
 
-- the master chooses *where* an object replica lives
-- the client chooses *when* to read or write it
-- `TransferSubmitter` chooses *how* to move the bytes
-- `Transfer Engine` chooses *which transport implementation* executes the move
+- master 负责决定 object replica 放在哪
+- client 负责决定什么时候读、什么时候写
+- `TransferSubmitter` 负责决定字节怎么搬
+- `Transfer Engine` 负责决定最终用哪个 transport implementation 执行
 
-## Hotspots for Modification
+## 如果要继续改代码，优先看这些入口
 
-If the goal is to change behavior, the best entry points are:
-
-1. `Client::Get` and `Client::Put` for user-visible semantics
-2. `TransferSubmitter::selectStrategy` for locality policy
-3. `TransferSubmitter::submitTransferEngineOperation` for request shaping
-4. `TransferEngineImpl::openSegment` for segment resolution behavior
-5. `MultiTransport::submitTransfer` for batching and dispatch policy
+1. `Client::Get` 和 `Client::Put`：改用户可见语义最直接
+2. `TransferSubmitter::selectStrategy`：改 locality policy 最直接
+3. `TransferSubmitter::submitTransferEngineOperation`：改 request 组织方式最直接
+4. `TransferEngineImpl::openSegment`：改 segment 解析语义最直接
+5. `MultiTransport::submitTransfer`：改 batching 和 dispatch policy 最直接
