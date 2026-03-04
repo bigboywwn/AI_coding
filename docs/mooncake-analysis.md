@@ -293,3 +293,4 @@ restore 的策略比较保守：
 
 - `docs/mooncake-transfer-paths.md`：更细的 `Client::Put/Get -> TransferSubmitter -> Transfer Engine` 路径分析
 - `docs/mooncake-masterservice-structures.md`：`MasterService` 内部状态容器和生命周期分析
+- `docs/mooncake-local-build-assessment.md`：基于当前 macOS 机器的本地可编译性评估

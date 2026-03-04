@@ -29,3 +29,4 @@ For solo work, direct commits to `main` are acceptable. If multiple efforts run 
 - `docs/mooncake-analysis.md`: `Mooncake` 仓库架构、`Transfer Engine` 和 `MasterService` 的总览分析
 - `docs/mooncake-transfer-paths.md`: `Client::Put/Get -> TransferSubmitter -> Transfer Engine` 的细粒度路径分析
 - `docs/mooncake-masterservice-structures.md`: `MasterService` 内部状态容器和生命周期分析
+- `docs/mooncake-local-build-assessment.md`: 基于当前 macOS 机器的 `Mooncake` 本地可编译性评估
