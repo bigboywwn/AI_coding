@@ -54,7 +54,8 @@ python3 lmstudio_openclaw_trace_proxy.py \
   --listen-host 127.0.0.1 \
   --listen-port 12434 \
   --upstream http://127.0.0.1:1234 \
-  --log-file ~/.openclaw/logs/lmstudio-openclaw-trace.jsonl
+  --log-file ~/.openclaw/logs/lmstudio-openclaw-trace.jsonl \
+  --diag-log-file ~/.openclaw/logs/lmstudio-openclaw-trace.diag.jsonl
 ```
 
 Default flags:
@@ -63,7 +64,10 @@ Default flags:
 - `--listen-port`: proxy bind port, default `12434`
 - `--upstream`: LM Studio base URL, default `http://127.0.0.1:1234`
 - `--log-file`: JSONL output path, default `~/.openclaw/logs/lmstudio-openclaw-trace.jsonl`
+- `--diag-log-file`: sidecar diagnostic JSONL path, default `~/.openclaw/logs/lmstudio-openclaw-trace.diag.jsonl`
 - `--timeout`: upstream request timeout in seconds, default `300`
+- `--stderr-verbose`: also emit diagnostic events to stderr in JSON form
+- `--max-body-chars`: truncate oversized request or response bodies before writing logs, default `12000`
 
 The log file will contain paired records like:
 
@@ -78,6 +82,35 @@ Useful fields:
 - `estimated_total_tokens`
 - `usage_prompt_tokens` / `usage_completion_tokens` when LM Studio returns them
 - `response_text`
+
+The diagnostic sidecar file is intentionally more verbose and is useful when the
+main trace file does not appear. It records:
+
+- proxy startup self-checks
+- every request receipt
+- every log append success or failure
+- upstream HTTP errors and Python exceptions
+- downstream client write failures
+
+Recommended debug launch for remote environments:
+
+```bash
+python3 lmstudio_openclaw_trace_proxy.py \
+  --listen-host 0.0.0.0 \
+  --listen-port 12434 \
+  --upstream http://127.0.0.1:8000 \
+  --log-file /tmp/lmstudio-openclaw-trace.jsonl \
+  --diag-log-file /tmp/lmstudio-openclaw-trace.diag.jsonl \
+  --stderr-verbose
+```
+
+If request forwarding works but the main log still does not grow, check the
+diagnostic file first. The usual failure modes are:
+
+- the configured log directory is not writable in the target runtime user
+- the proxy can write startup diagnostics but fails on request or response append
+- the response body is large or non-JSON, so only the truncated raw body is stored
+- the proxy process is started from a service manager that hides stderr unless explicitly captured
 
 Current behavior note:
 

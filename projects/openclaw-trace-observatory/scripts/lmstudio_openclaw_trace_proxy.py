@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 import uuid
@@ -24,6 +25,14 @@ def append_jsonl(path: str, record: dict) -> None:
     ensure_parent(path)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def safe_stderr(message: str) -> None:
+    try:
+        sys.stderr.write(message.rstrip("\n") + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 def estimate_tokens_text(text: str) -> int:
@@ -147,30 +156,105 @@ def extract_text_from_response(response_json: Optional[dict], body_text: str) ->
 class ProxyHandler(BaseHTTPRequestHandler):
     upstream = ""
     log_path = ""
+    diag_log_path = ""
     timeout = 300
+    stderr_verbose = False
+    max_body_chars = 12000
 
     server_version = "OpenClawLMStudioTraceProxy/1.0"
 
     def log_message(self, fmt: str, *args) -> None:
         sys.stderr.write("%s - - [%s] %s\n" % (self.client_address[0], self.log_date_time_string(), fmt % args))
 
+    def _diag(self, event: str, **fields) -> None:
+        record = {
+            "ts": now_ms(),
+            "kind": "proxy_diag",
+            "event": event,
+            **fields,
+        }
+        line = json.dumps(record, ensure_ascii=False)
+        if self.stderr_verbose:
+            safe_stderr(line)
+        if not self.diag_log_path:
+            return
+        try:
+            append_jsonl(self.diag_log_path, record)
+        except Exception as e:
+            safe_stderr(
+                json.dumps(
+                    {
+                        "ts": now_ms(),
+                        "kind": "proxy_diag_write_error",
+                        "event": event,
+                        "diag_log_path": self.diag_log_path,
+                        "error": repr(e),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+    def _safe_append_log(self, record: dict, stage: str, request_id: str) -> bool:
+        try:
+            append_jsonl(self.log_path, record)
+            self._diag(
+                "log_append_ok",
+                request_id=request_id,
+                stage=stage,
+                log_path=self.log_path,
+                record_kind=record.get("kind"),
+            )
+            return True
+        except Exception as e:
+            self._diag(
+                "log_append_failed",
+                request_id=request_id,
+                stage=stage,
+                log_path=self.log_path,
+                record_kind=record.get("kind"),
+                error=repr(e),
+                traceback=traceback.format_exc(),
+            )
+            return False
+
+    def _truncate_text(self, value: str) -> str:
+        if len(value) <= self.max_body_chars:
+            return value
+        return value[: self.max_body_chars] + f"\n... <truncated {len(value) - self.max_body_chars} chars>"
+
     def _proxy(self) -> None:
         req_id = str(uuid.uuid4())
         started = now_ms()
-        content_length = int(self.headers.get("Content-Length", "0") or "0")
+        try:
+            content_length = int(self.headers.get("Content-Length", "0") or "0")
+        except Exception:
+            content_length = 0
         body = self.rfile.read(content_length) if content_length > 0 else b""
         upstream_url = self.upstream.rstrip("/") + self.path
 
         request_headers = {k: v for k, v in self.headers.items()}
         request_headers.pop("Host", None)
         request_headers["Connection"] = "close"
+        self._diag(
+            "request_received",
+            request_id=req_id,
+            method=self.command,
+            path=self.path,
+            upstream_url=upstream_url,
+            content_length=content_length,
+            client=self.client_address[0],
+            log_path=self.log_path,
+            diag_log_path=self.diag_log_path,
+        )
 
         request_json = None
+        request_json_error = None
         if body:
             try:
                 request_json = json.loads(body.decode("utf-8"))
-            except Exception:
+            except Exception as e:
                 request_json = None
+                request_json_error = repr(e)
         estimated_prompt_tokens = estimate_tokens_payload(request_json)
 
         request_record = {
@@ -181,13 +265,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "path": self.path,
             "client": self.client_address[0],
             "headers": request_headers,
-            "body_text": body.decode("utf-8", errors="replace") if body else "",
+            "body_text": self._truncate_text(body.decode("utf-8", errors="replace")) if body else "",
             "body_json": request_json,
+            "body_parse_error": request_json_error,
             "proxy_mode": "passthrough",
             "token_source": "estimated",
             "estimated_prompt_tokens": estimated_prompt_tokens,
         }
-        append_jsonl(self.log_path, request_record)
+        self._safe_append_log(request_record, stage="request", request_id=req_id)
 
         req = urllib.request.Request(
             upstream_url,
@@ -205,6 +290,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             raw = e.read()
             status = e.code
             resp_headers = dict(e.headers.items())
+            self._diag(
+                "upstream_http_error",
+                request_id=req_id,
+                status=status,
+                duration_ms=now_ms() - started,
+                response_content_type=resp_headers.get("Content-Type"),
+            )
         except Exception as e:
             error_record = {
                 "ts": now_ms(),
@@ -216,7 +308,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "error": repr(e),
                 "duration_ms": now_ms() - started,
             }
-            append_jsonl(self.log_path, error_record)
+            self._safe_append_log(error_record, stage="proxy_error", request_id=req_id)
+            self._diag(
+                "upstream_exception",
+                request_id=req_id,
+                error=repr(e),
+                traceback=traceback.format_exc(),
+                duration_ms=now_ms() - started,
+            )
             self.send_response(502)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.end_headers()
@@ -226,11 +325,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         response_json = None
         usage = None
         body_text = raw.decode("utf-8", errors="replace")
+        response_json_error = None
         try:
             response_json = json.loads(body_text)
             usage = response_json.get("usage") if isinstance(response_json, dict) else None
-        except Exception:
+        except Exception as e:
             response_json = None
+            response_json_error = repr(e)
 
         completion_text = extract_text_from_response(response_json, body_text)
         estimated_completion_tokens = estimate_tokens_text(completion_text) if completion_text else 0
@@ -250,8 +351,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "status": status,
             "duration_ms": now_ms() - started,
             "headers": resp_headers,
-            "body_text": body_text,
+            "body_text": self._truncate_text(body_text),
             "body_json": response_json,
+            "body_parse_error": response_json_error,
             "usage": usage,
             "usage_prompt_tokens": usage.get("prompt_tokens") if isinstance(usage, dict) else None,
             "usage_completion_tokens": usage.get("completion_tokens") if isinstance(usage, dict) else None,
@@ -263,7 +365,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "estimated_completion_tokens": estimated_completion_tokens,
             "estimated_total_tokens": estimated_total_tokens,
         }
-        append_jsonl(self.log_path, response_record)
+        self._safe_append_log(response_record, stage="response", request_id=req_id)
+        self._diag(
+            "upstream_response_ready",
+            request_id=req_id,
+            status=status,
+            duration_ms=now_ms() - started,
+            response_content_type=resp_headers.get("Content-Type"),
+            raw_bytes=len(raw),
+            has_usage=isinstance(usage, dict),
+            body_parse_error=response_json_error,
+        )
 
         self.send_response(status)
         for key, value in resp_headers.items():
@@ -273,7 +385,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_header(key, value)
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.wfile.write(raw)
+            self._diag(
+                "client_response_sent",
+                request_id=req_id,
+                status=status,
+                bytes_sent=len(raw),
+                duration_ms=now_ms() - started,
+            )
+        except Exception as e:
+            self._diag(
+                "client_write_failed",
+                request_id=req_id,
+                status=status,
+                bytes_attempted=len(raw),
+                error=repr(e),
+                traceback=traceback.format_exc(),
+            )
+            raise
 
     def do_GET(self) -> None:
         self._proxy()
@@ -288,18 +418,56 @@ def main() -> int:
     parser.add_argument("--listen-port", type=int, default=12434)
     parser.add_argument("--upstream", default="http://127.0.0.1:1234")
     parser.add_argument("--log-file", default=os.path.expanduser("~/.openclaw/logs/lmstudio-openclaw-trace.jsonl"))
+    parser.add_argument("--diag-log-file", default=os.path.expanduser("~/.openclaw/logs/lmstudio-openclaw-trace.diag.jsonl"))
     parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--stderr-verbose", action="store_true")
+    parser.add_argument("--max-body-chars", type=int, default=12000)
     args = parser.parse_args()
 
     ProxyHandler.upstream = args.upstream.rstrip("/")
     ProxyHandler.log_path = os.path.expanduser(args.log_file)
+    ProxyHandler.diag_log_path = os.path.expanduser(args.diag_log_file)
     ProxyHandler.timeout = args.timeout
+    ProxyHandler.stderr_verbose = args.stderr_verbose
+    ProxyHandler.max_body_chars = max(1000, args.max_body_chars)
 
     ensure_parent(ProxyHandler.log_path)
+    ensure_parent(ProxyHandler.diag_log_path)
+    startup_record = {
+        "ts": now_ms(),
+        "kind": "proxy_startup",
+        "listen_host": args.listen_host,
+        "listen_port": args.listen_port,
+        "upstream": ProxyHandler.upstream,
+        "log_path": ProxyHandler.log_path,
+        "diag_log_path": ProxyHandler.diag_log_path,
+        "log_dir_writable": os.access(os.path.dirname(os.path.abspath(ProxyHandler.log_path)), os.W_OK),
+        "diag_dir_writable": os.access(os.path.dirname(os.path.abspath(ProxyHandler.diag_log_path)), os.W_OK),
+        "pid": os.getpid(),
+        "python": sys.version,
+        "cwd": os.getcwd(),
+    }
+    try:
+        append_jsonl(ProxyHandler.diag_log_path, startup_record)
+    except Exception as e:
+        safe_stderr(json.dumps({"kind": "proxy_startup_diag_write_failed", "error": repr(e)}, ensure_ascii=False))
+    try:
+        append_jsonl(ProxyHandler.log_path, startup_record)
+    except Exception as e:
+        safe_stderr(
+            json.dumps(
+                {
+                    "kind": "proxy_startup_log_write_failed",
+                    "log_path": ProxyHandler.log_path,
+                    "error": repr(e),
+                },
+                ensure_ascii=False,
+            )
+        )
     server = ThreadingHTTPServer((args.listen_host, args.listen_port), ProxyHandler)
     print(
         f"OpenClaw LM Studio trace proxy listening on http://{args.listen_host}:{args.listen_port} "
-        f"-> {ProxyHandler.upstream} | log={ProxyHandler.log_path}",
+        f"-> {ProxyHandler.upstream} | log={ProxyHandler.log_path} | diag={ProxyHandler.diag_log_path}",
         flush=True,
     )
     try:
