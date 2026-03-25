@@ -31,3 +31,7 @@ For solo work, direct commits to `main` are acceptable. If multiple efforts run 
 - `docs/mooncake-masterservice-structures.md`: `MasterService` 内部状态容器和生命周期分析
 - `docs/mooncake-local-build-assessment.md`: 基于当前 macOS 机器的 `Mooncake` 本地可编译性评估
 - `docs/fast26-ai-and-llms-analysis.md`: FAST 2026 `AI and LLMs` session 的 9 篇论文中文分析报告
+
+## Projects
+
+- `projects/openclaw-trace-observatory/`: OpenClaw + LM Studio 本地追踪工具箱，包含代理脚本、可视化 viewer 和日志样本

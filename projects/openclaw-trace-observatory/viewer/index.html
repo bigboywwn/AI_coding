@@ -1,0 +1,911 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenClaw Trace Viewer</title>
+  <style>
+    :root {
+      --bg: #f4efe6;
+      --panel: #fffaf3;
+      --panel-2: #f8f1e7;
+      --ink: #1e1a17;
+      --muted: #72675d;
+      --line: #dfd3c3;
+      --accent: #cb5f2c;
+      --accent-soft: rgba(203, 95, 44, 0.16);
+      --green: #2e8b57;
+      --yellow: #d18a00;
+      --red: #b43f3f;
+      --mono: "SFMono-Regular", "Consolas", "Menlo", monospace;
+      --sans: "Avenir Next", "PingFang SC", "Helvetica Neue", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(203, 95, 44, 0.08), transparent 28%),
+        linear-gradient(180deg, #f8f3ea 0%, var(--bg) 100%);
+    }
+
+    .app {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      min-height: 100vh;
+    }
+
+    .sidebar,
+    .main {
+      padding: 20px;
+    }
+
+    .sidebar {
+      border-right: 1px solid var(--line);
+      background: rgba(255, 250, 243, 0.84);
+      backdrop-filter: blur(10px);
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow: auto;
+    }
+
+    .main {
+      overflow: auto;
+    }
+
+    h1, h2, h3 {
+      margin: 0;
+      line-height: 1.1;
+    }
+
+    .eyebrow {
+      font-size: 12px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .hero {
+      display: grid;
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+
+    .hero p,
+    .muted {
+      color: var(--muted);
+      margin: 0;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: 0 12px 40px rgba(61, 41, 24, 0.06);
+    }
+
+    .panel.pad {
+      padding: 16px;
+    }
+
+    .controls {
+      display: grid;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+
+    input, button, select {
+      width: 100%;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      padding: 11px 12px;
+      font: inherit;
+      background: #fffdfa;
+      color: var(--ink);
+    }
+
+    button {
+      cursor: pointer;
+      background: linear-gradient(135deg, #db6d39, #ba4f20);
+      color: white;
+      border: none;
+      font-weight: 600;
+    }
+
+    button.secondary {
+      background: var(--panel-2);
+      color: var(--ink);
+      border: 1px solid var(--line);
+    }
+
+    .status {
+      font-size: 13px;
+      color: var(--muted);
+      min-height: 18px;
+    }
+
+    .flow-list,
+    .round-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .flow-item,
+    .round-item {
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.78);
+      padding: 12px;
+      cursor: pointer;
+    }
+
+    .flow-item.active,
+    .round-item.active {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
+    }
+
+    .flow-item .meta,
+    .round-item .meta {
+      margin-top: 8px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      padding: 4px 10px;
+      background: var(--panel-2);
+      border: 1px solid var(--line);
+    }
+
+    .grid {
+      display: grid;
+      gap: 16px;
+    }
+
+    .summary-grid {
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    }
+
+    .card-num {
+      font-size: 28px;
+      font-weight: 700;
+      margin-top: 8px;
+    }
+
+    .chart-wrap {
+      padding: 14px 16px 18px;
+    }
+
+    svg {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+
+    .legend {
+      display: flex;
+      gap: 16px;
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 10px;
+    }
+
+    .legend span::before {
+      content: "";
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+
+    .legend .prompt::before {
+      background: var(--accent);
+    }
+
+    .legend .completion::before {
+      background: var(--green);
+    }
+
+    .section {
+      margin-top: 18px;
+    }
+
+    .message {
+      border-top: 1px solid var(--line);
+      padding: 12px 0;
+    }
+
+    .message:first-child {
+      border-top: none;
+      padding-top: 0;
+    }
+
+    .role {
+      font-size: 12px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .content {
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.55;
+      background: rgba(255, 255, 255, 0.55);
+      border-radius: 12px;
+      padding: 12px;
+      border: 1px solid rgba(223, 211, 195, 0.7);
+    }
+
+    mark.added {
+      background: #ffe59b;
+      color: inherit;
+      padding: 0 2px;
+      border-radius: 4px;
+    }
+
+    .tiny {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 16px;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+
+    .toolbar .inline {
+      flex: 1;
+      min-width: 240px;
+    }
+
+    .empty {
+      padding: 26px;
+      text-align: center;
+      color: var(--muted);
+    }
+
+    @media (max-width: 1100px) {
+      .app,
+      .split {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        position: static;
+        height: auto;
+        border-right: none;
+        border-bottom: 1px solid var(--line);
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="hero">
+        <div class="eyebrow">OpenClaw Trace</div>
+        <h1>本地推理请求可视化</h1>
+        <p>按 flow 还原 OpenClaw 如何把一个 session 拆成多轮模型调用，并展示每轮 prompt token 的增长。</p>
+      </div>
+
+      <div class="panel pad">
+        <div class="controls">
+          <input id="logPath" value="/Users/mlx/.openclaw/logs/lmstudio-openclaw-trace.jsonl" />
+          <input id="openclawLogPath" value="/tmp/openclaw/openclaw-2026-03-25.log" />
+          <button id="loadBtn">加载日志</button>
+          <button id="refreshBtn" class="secondary">刷新当前路径</button>
+          <button id="clearBtn" class="secondary">清空当前日志</button>
+          <label class="tiny"><input id="autoRefresh" type="checkbox" checked style="width:auto;margin-right:8px;">15 秒自动刷新</label>
+        </div>
+        <div id="status" class="status">等待加载</div>
+      </div>
+
+      <div class="section">
+        <div class="eyebrow">Flows</div>
+        <div id="flowList" class="flow-list"></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="toolbar">
+        <div class="inline panel pad">
+          <div class="eyebrow">筛选</div>
+          <select id="roundSelector"></select>
+        </div>
+        <div class="inline panel pad">
+          <div class="eyebrow">视图说明</div>
+          <div class="tiny">黄色高亮代表相对上一轮新增的 prompt 片段。如果整条消息是新增 append，会整块高亮。</div>
+        </div>
+      </div>
+
+      <div id="overview" class="grid summary-grid"></div>
+      <div id="contentArea"></div>
+    </main>
+  </div>
+
+  <script>
+    const state = {
+      rows: [],
+      openclawEvents: [],
+      requests: [],
+      flows: [],
+      selectedFlowId: null,
+      selectedRoundId: null,
+      timer: null,
+    };
+
+    const $ = (id) => document.getElementById(id);
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+    }
+
+    function flattenContent(value) {
+      if (value == null) return "";
+      if (typeof value === "string") return value;
+      if (Array.isArray(value)) {
+        return value.map((item) => {
+          if (item && typeof item === "object") {
+            if (item.type === "text") return item.text || "";
+            if ("text" in item) return item.text || "";
+            return JSON.stringify(item, null, 2);
+          }
+          return String(item);
+        }).filter(Boolean).join("\n");
+      }
+      if (typeof value === "object") {
+        if ("text" in value) return value.text || "";
+        return JSON.stringify(value, null, 2);
+      }
+      return String(value);
+    }
+
+    function parseSseText(bodyText) {
+      const chunks = [];
+      const lines = bodyText.split(/\r?\n/);
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        try {
+          const parsed = JSON.parse(payload);
+          const choice = parsed.choices && parsed.choices[0];
+          const delta = choice && choice.delta;
+          if (delta) {
+            if (delta.reasoning_content) chunks.push(flattenContent(delta.reasoning_content));
+            if (delta.content) chunks.push(flattenContent(delta.content));
+          }
+        } catch (error) {
+          continue;
+        }
+      }
+      return chunks.join("");
+    }
+
+    function normalizeRequest(req, resp) {
+      const body = req.body_json || {};
+      const messages = (body.messages || []).map((message, index) => ({
+        index,
+        role: message.role || "unknown",
+        content: flattenContent(message.content),
+      }));
+      const responseText = resp.response_text || parseSseText(resp.body_text || "");
+      return {
+        requestId: req.request_id,
+        ts: req.ts,
+        isoTime: new Date(req.ts).toLocaleString(),
+        model: body.model || "",
+        messages,
+        messageCount: messages.length,
+        estimatedPromptTokens: req.estimated_prompt_tokens ?? resp.estimated_prompt_tokens ?? 0,
+        estimatedCompletionTokens: resp.estimated_completion_tokens ?? 0,
+        estimatedTotalTokens: resp.estimated_total_tokens ?? 0,
+        status: resp.status,
+        durationMs: resp.duration_ms ?? 0,
+        responseText,
+      };
+    }
+
+    function parseTs(value) {
+      const ms = Date.parse(value);
+      return Number.isFinite(ms) ? ms : 0;
+    }
+
+    function longestCommonPrefix(prevMessages, nextMessages) {
+      let count = 0;
+      while (
+        count < prevMessages.length &&
+        count < nextMessages.length &&
+        prevMessages[count].role === nextMessages[count].role &&
+        prevMessages[count].content === nextMessages[count].content
+      ) {
+        count += 1;
+      }
+      return count;
+    }
+
+    function assignFlows(requests) {
+      const flows = [];
+      for (const request of requests) {
+        let bestFlow = null;
+        let bestPrefix = -1;
+        for (const flow of flows) {
+          const last = flow.requests[flow.requests.length - 1];
+          const prefix = longestCommonPrefix(last.messages, request.messages);
+          const continuation = prefix >= Math.max(1, Math.min(last.messages.length, request.messages.length) - 2);
+          const appendish = request.messages.length >= last.messages.length;
+          if (continuation && appendish && prefix > bestPrefix) {
+            bestFlow = flow;
+            bestPrefix = prefix;
+          }
+        }
+        if (!bestFlow) {
+          bestFlow = {
+            id: `flow-${flows.length + 1}`,
+            requests: [],
+          };
+          flows.push(bestFlow);
+        }
+        request.flowId = bestFlow.id;
+        request.round = bestFlow.requests.length + 1;
+        request.prevRequestId = bestFlow.requests.length ? bestFlow.requests[bestFlow.requests.length - 1].requestId : null;
+        bestFlow.requests.push(request);
+      }
+
+      for (const flow of flows) {
+        flow.startTs = flow.requests[0]?.ts || 0;
+        flow.endTs = flow.requests.at(-1)?.ts || 0;
+        flow.totalPromptTokens = flow.requests.reduce((sum, item) => sum + (item.estimatedPromptTokens || 0), 0);
+        flow.maxPromptTokens = Math.max(...flow.requests.map((item) => item.estimatedPromptTokens || 0), 0);
+        flow.title = buildFlowTitle(flow);
+      }
+      return flows;
+    }
+
+    function correlateFlows(flows, events) {
+      const accepted = events.filter((event) => (event.text || "").includes("→ res ✓ agent") && event.runId);
+      const withRun = events.filter((event) => event.runId);
+      for (const flow of flows) {
+        const start = flow.startTs;
+        const end = flow.endTs;
+        let best = null;
+        let bestScore = Number.POSITIVE_INFINITY;
+        for (const event of accepted) {
+          const eventTs = event.ts || 0;
+          const delta = start - eventTs;
+          if (delta < -30000 || delta > 300000) continue;
+          const score = Math.abs(delta);
+          if (score < bestScore) {
+            best = event;
+            bestScore = score;
+          }
+        }
+        if (!best) {
+          for (const event of withRun) {
+            const eventTs = event.ts || 0;
+            const delta = Math.min(Math.abs(eventTs - start), Math.abs(eventTs - end));
+            if (delta > 180000) continue;
+            if (delta < bestScore) {
+              best = event;
+              bestScore = delta;
+            }
+          }
+        }
+        flow.correlatedRun = best ? {
+          runId: best.runId || null,
+          sessionId: best.sessionId || null,
+          sessionKey: best.sessionKey || null,
+          sourceText: best.text || best.event || "",
+          sourceTs: best.ts || 0,
+          confidence: best && (best.text || "").includes("→ res ✓ agent") ? "medium" : "low",
+        } : null;
+        flow.relatedEvents = best?.runId
+          ? events.filter((event) => event.runId === best.runId)
+          : events.filter((event) => {
+              const eventTs = event.ts || 0;
+              return eventTs >= start - 30000 && eventTs <= end + 30000;
+            });
+      }
+    }
+
+    function buildFlowTitle(flow) {
+      const first = flow.requests[0];
+      if (!first) return "空 flow";
+      const firstUser = first.messages.find((m) => m.role === "user" && m.content.trim());
+      const snippet = (firstUser?.content || "无用户消息").replace(/\s+/g, " ").slice(0, 42);
+      return `${snippet}${snippet.length >= 42 ? "..." : ""}`;
+    }
+
+    function computeDelta(prevRequest, currentRequest) {
+      const prevMessages = prevRequest?.messages || [];
+      const currMessages = currentRequest.messages || [];
+      const shared = longestCommonPrefix(prevMessages, currMessages);
+      const deltas = currMessages.map((message, index) => {
+        const prev = prevMessages[index];
+        if (index < shared) {
+          return {
+            role: message.role,
+            html: `<div class="content">${escapeHtml(message.content)}</div>`,
+            mode: "unchanged",
+          };
+        }
+        if (prev && prev.role === message.role && message.content.startsWith(prev.content)) {
+          const unchanged = escapeHtml(prev.content);
+          const added = escapeHtml(message.content.slice(prev.content.length));
+          return {
+            role: message.role,
+            html: `<div class="content">${unchanged}<mark class="added">${added || " "}</mark></div>`,
+            mode: "extended",
+          };
+        }
+        return {
+          role: message.role,
+          html: `<div class="content"><mark class="added">${escapeHtml(message.content || "(empty)")}</mark></div>`,
+          mode: "appended",
+        };
+      });
+      return { shared, deltas };
+    }
+
+    function buildOverview(flows) {
+      const totalRequests = flows.reduce((sum, flow) => sum + flow.requests.length, 0);
+      const maxPrompt = Math.max(...flows.flatMap((flow) => flow.requests.map((req) => req.estimatedPromptTokens || 0)), 0);
+      const avgPrompt = totalRequests
+        ? Math.round(flows.reduce((sum, flow) => sum + flow.totalPromptTokens, 0) / totalRequests)
+        : 0;
+      const cards = [
+        ["推断 Flows", flows.length],
+        ["总请求数", totalRequests],
+        ["最大 Input Token", maxPrompt],
+        ["平均 Input Token", avgPrompt],
+      ];
+      $("overview").innerHTML = cards.map(([label, value]) => `
+        <div class="panel pad">
+          <div class="eyebrow">${label}</div>
+          <div class="card-num">${value}</div>
+        </div>
+      `).join("");
+    }
+
+    function renderFlowList() {
+      const list = $("flowList");
+      if (!state.flows.length) {
+        list.innerHTML = `<div class="panel empty">暂无可展示的 flow</div>`;
+        return;
+      }
+      list.innerHTML = state.flows.map((flow) => `
+        <div class="flow-item ${flow.id === state.selectedFlowId ? "active" : ""}" data-flow-id="${flow.id}">
+          <strong>${escapeHtml(flow.title)}</strong>
+          <div class="meta">
+            <span class="badge">${flow.requests.length} 轮</span>
+            <span class="badge">最大 ${flow.maxPromptTokens} tok</span>
+            ${flow.correlatedRun?.runId ? `<span class="badge">run ${escapeHtml(flow.correlatedRun.runId.slice(0, 8))}</span>` : ""}
+          </div>
+        </div>
+      `).join("");
+      list.querySelectorAll(".flow-item").forEach((node) => {
+        node.addEventListener("click", () => {
+          state.selectedFlowId = node.dataset.flowId;
+          const flow = state.flows.find((item) => item.id === state.selectedFlowId);
+          state.selectedRoundId = flow?.requests.at(-1)?.requestId || null;
+          render();
+        });
+      });
+    }
+
+    function renderRoundSelector(flow) {
+      const selector = $("roundSelector");
+      if (!flow) {
+        selector.innerHTML = `<option>暂无轮次</option>`;
+        return;
+      }
+      selector.innerHTML = flow.requests.map((request) => `
+        <option value="${request.requestId}" ${request.requestId === state.selectedRoundId ? "selected" : ""}>
+          Round ${request.round} · ${request.estimatedPromptTokens} tok · ${request.isoTime}
+        </option>
+      `).join("");
+      selector.onchange = () => {
+        state.selectedRoundId = selector.value;
+        renderContent();
+      };
+    }
+
+    function renderChart(flow) {
+      const width = 900;
+      const height = 260;
+      const pad = 36;
+      const maxPrompt = Math.max(...flow.requests.map((item) => item.estimatedPromptTokens || 0), 1);
+      const maxCompletion = Math.max(...flow.requests.map((item) => item.estimatedCompletionTokens || 0), 1);
+      const maxValue = Math.max(maxPrompt, maxCompletion);
+      const stepX = flow.requests.length > 1 ? (width - pad * 2) / (flow.requests.length - 1) : 0;
+      const y = (value) => height - pad - ((value || 0) / maxValue) * (height - pad * 2);
+      const promptPoints = flow.requests.map((req, index) => `${pad + index * stepX},${y(req.estimatedPromptTokens)}`).join(" ");
+      const completionPoints = flow.requests.map((req, index) => `${pad + index * stepX},${y(req.estimatedCompletionTokens)}`).join(" ");
+      const labels = flow.requests.map((req, index) => `
+        <text x="${pad + index * stepX}" y="${height - 10}" text-anchor="middle" font-size="11" fill="#72675d">R${req.round}</text>
+      `).join("");
+      return `
+        <div class="panel chart-wrap">
+          <div class="eyebrow">Input / Output Tokens by Round</div>
+          <svg viewBox="0 0 ${width} ${height}" aria-label="token chart">
+            <line x1="${pad}" y1="${height - pad}" x2="${width - pad}" y2="${height - pad}" stroke="#cdbfae" />
+            <line x1="${pad}" y1="${pad}" x2="${pad}" y2="${height - pad}" stroke="#cdbfae" />
+            <polyline fill="none" stroke="#cb5f2c" stroke-width="3" points="${promptPoints}" />
+            <polyline fill="none" stroke="#2e8b57" stroke-width="3" points="${completionPoints}" />
+            ${flow.requests.map((req, index) => `
+              <circle cx="${pad + index * stepX}" cy="${y(req.estimatedPromptTokens)}" r="4" fill="#cb5f2c" />
+              <circle cx="${pad + index * stepX}" cy="${y(req.estimatedCompletionTokens)}" r="4" fill="#2e8b57" />
+            `).join("")}
+            ${labels}
+          </svg>
+          <div class="legend">
+            <span class="prompt">Prompt tokens</span>
+            <span class="completion">Completion tokens</span>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderRoundList(flow) {
+      return `
+        <div class="panel pad">
+          <div class="eyebrow">Rounds</div>
+          <div class="round-list">
+            ${flow.requests.map((request) => `
+              <div class="round-item ${request.requestId === state.selectedRoundId ? "active" : ""}" data-round-id="${request.requestId}">
+                <strong>Round ${request.round}</strong>
+                <div class="meta">
+                  <span class="badge">in ${request.estimatedPromptTokens}</span>
+                  <span class="badge">out ${request.estimatedCompletionTokens}</span>
+                  <span class="badge">${request.durationMs} ms</span>
+                </div>
+              </div>
+            `).join("")}
+          </div>
+        </div>
+      `;
+    }
+
+    function renderCorrelation(flow) {
+      const run = flow.correlatedRun;
+      const items = flow.relatedEvents || [];
+      return `
+        <div class="panel pad">
+          <div class="eyebrow">OpenClaw Run Correlation</div>
+          <div class="tiny">这是基于时间窗口推断的关联，不一定 100% 精确。</div>
+          <div class="section">
+            <div class="meta">
+              <span class="badge">confidence: ${escapeHtml(run?.confidence || "none")}</span>
+              ${run?.runId ? `<span class="badge">runId: ${escapeHtml(run.runId)}</span>` : `<span class="badge">未关联到 runId</span>`}
+              ${run?.sessionId ? `<span class="badge">sessionId: ${escapeHtml(run.sessionId)}</span>` : ""}
+              ${run?.sessionKey ? `<span class="badge">sessionKey: ${escapeHtml(run.sessionKey)}</span>` : ""}
+            </div>
+            ${run?.sourceText ? `<div class="content" style="margin-top:12px">${escapeHtml(run.sourceText)}</div>` : ""}
+          </div>
+          <div class="section">
+            <div class="eyebrow">Related Events</div>
+            ${items.length ? items.map((event) => `
+              <div class="message">
+                <div class="role">${escapeHtml(event.subsystem || "openclaw")} · ${escapeHtml(event.time || "")}</div>
+                <div class="content">${escapeHtml(event.text || event.event || "")}</div>
+              </div>
+            `).join("") : `<div class="tiny">没有找到可关联的 OpenClaw 事件。</div>`}
+          </div>
+        </div>
+      `;
+    }
+
+    function renderMessages(flow, currentRequest) {
+      const previous = flow.requests.find((request) => request.requestId === currentRequest.prevRequestId);
+      const { shared, deltas } = computeDelta(previous, currentRequest);
+      return `
+        <div class="panel pad">
+          <div class="eyebrow">Prompt Delta</div>
+          <div class="tiny">与上一轮共有 ${shared} 条完全相同的 messages。新增或扩展的片段已高亮。</div>
+          <div class="section">
+            ${deltas.map((item) => `
+              <div class="message">
+                <div class="role">${escapeHtml(item.role)} · ${item.mode}</div>
+                ${item.html}
+              </div>
+            `).join("")}
+          </div>
+        </div>
+      `;
+    }
+
+    function renderResponse(request) {
+      return `
+        <div class="panel pad">
+          <div class="eyebrow">Model Output</div>
+          <div class="tiny">status ${request.status} · ${request.durationMs} ms</div>
+          <div class="section">
+            <div class="content">${escapeHtml(request.responseText || "(empty response)")}</div>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderContent() {
+      const flow = state.flows.find((item) => item.id === state.selectedFlowId);
+      const content = $("contentArea");
+      renderRoundSelector(flow);
+      if (!flow) {
+        content.innerHTML = `<div class="panel empty">先加载日志</div>`;
+        return;
+      }
+      const current = flow.requests.find((item) => item.requestId === state.selectedRoundId) || flow.requests.at(-1);
+      state.selectedRoundId = current.requestId;
+      content.innerHTML = `
+        ${renderChart(flow)}
+        <div class="section split">
+          ${renderRoundList(flow)}
+          <div class="grid summary-grid">
+            <div class="panel pad">
+              <div class="eyebrow">当前轮次</div>
+              <div class="card-num">R${current.round}</div>
+            </div>
+            <div class="panel pad">
+              <div class="eyebrow">Input</div>
+              <div class="card-num">${current.estimatedPromptTokens}</div>
+            </div>
+            <div class="panel pad">
+              <div class="eyebrow">Output</div>
+              <div class="card-num">${current.estimatedCompletionTokens}</div>
+            </div>
+            <div class="panel pad">
+              <div class="eyebrow">Messages</div>
+              <div class="card-num">${current.messageCount}</div>
+            </div>
+          </div>
+        </div>
+        <div class="section split">
+          ${renderMessages(flow, current)}
+          ${renderResponse(current)}
+        </div>
+        <div class="section">
+          ${renderCorrelation(flow)}
+        </div>
+      `;
+      content.querySelectorAll(".round-item").forEach((node) => {
+        node.addEventListener("click", () => {
+          state.selectedRoundId = node.dataset.roundId;
+          renderContent();
+        });
+      });
+    }
+
+    function render() {
+      buildOverview(state.flows);
+      renderFlowList();
+      renderContent();
+    }
+
+    async function loadLogs() {
+      const path = $("logPath").value.trim();
+      const openclawPath = $("openclawLogPath").value.trim();
+      $("status").textContent = "加载中...";
+      try {
+        const [response, eventResponse] = await Promise.all([
+          fetch(`/api/logs?path=${encodeURIComponent(path)}`),
+          fetch(`/api/openclaw-events?path=${encodeURIComponent(openclawPath)}`),
+        ]);
+        const payload = await response.json();
+        const eventPayload = await eventResponse.json();
+        if (!response.ok || !payload.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+        if (!eventResponse.ok || !eventPayload.ok) throw new Error(`OpenClaw log: ${eventPayload.error || `HTTP ${eventResponse.status}`}`);
+        state.rows = payload.rows || [];
+        state.openclawEvents = (eventPayload.rows || []).map((row) => ({
+          ...row,
+          ts: parseTs(row.time),
+        })).sort((a, b) => a.ts - b.ts);
+        const pairs = new Map();
+        for (const row of state.rows) {
+          if (!row.request_id) continue;
+          const pair = pairs.get(row.request_id) || {};
+          pair[row.kind] = row;
+          pairs.set(row.request_id, pair);
+        }
+        state.requests = Array.from(pairs.values())
+          .filter((pair) => pair.openclaw_request && pair.lmstudio_response)
+          .map((pair) => normalizeRequest(pair.openclaw_request, pair.lmstudio_response))
+          .sort((a, b) => a.ts - b.ts);
+        state.flows = assignFlows(state.requests);
+        correlateFlows(state.flows, state.openclawEvents);
+        if (!state.flows.find((flow) => flow.id === state.selectedFlowId)) {
+          state.selectedFlowId = state.flows[0]?.id || null;
+        }
+        const selectedFlow = state.flows.find((flow) => flow.id === state.selectedFlowId);
+        if (!selectedFlow?.requests.find((req) => req.requestId === state.selectedRoundId)) {
+          state.selectedRoundId = selectedFlow?.requests.at(-1)?.requestId || null;
+        }
+        $("status").textContent = `已加载 ${state.requests.length} 条请求、${state.openclawEvents.length} 条 OpenClaw 事件，推断出 ${state.flows.length} 个 flows。`;
+        render();
+      } catch (error) {
+        $("status").textContent = `加载失败: ${error.message}`;
+      }
+    }
+
+    async function clearLogs() {
+      const path = $("logPath").value.trim();
+      const confirmed = window.confirm(`确定要清空这个日志文件吗？\n${path}`);
+      if (!confirmed) return;
+      $("status").textContent = "正在清空...";
+      try {
+        const response = await fetch("/api/logs/clear", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ path }),
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) {
+          throw new Error(payload.error || `HTTP ${response.status}`);
+        }
+        state.rows = [];
+        state.requests = [];
+        state.flows = [];
+        state.selectedFlowId = null;
+        state.selectedRoundId = null;
+        $("status").textContent = `已清空 ${payload.path}`;
+        render();
+      } catch (error) {
+        $("status").textContent = `清空失败: ${error.message}`;
+      }
+    }
+
+    $("loadBtn").addEventListener("click", loadLogs);
+    $("refreshBtn").addEventListener("click", loadLogs);
+    $("clearBtn").addEventListener("click", clearLogs);
+    $("autoRefresh").addEventListener("change", () => {
+      if (state.timer) {
+        clearInterval(state.timer);
+        state.timer = null;
+      }
+      if ($("autoRefresh").checked) {
+        state.timer = setInterval(loadLogs, 15000);
+      }
+    });
+
+    state.timer = setInterval(() => {
+      if ($("autoRefresh").checked) loadLogs();
+    }, 15000);
+    loadLogs();
+  </script>
+</body>
+</html>
