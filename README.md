@@ -31,6 +31,7 @@ For solo work, direct commits to `main` are acceptable. If multiple efforts run 
 - `docs/mooncake-masterservice-structures.md`: `MasterService` 内部状态容器和生命周期分析
 - `docs/mooncake-local-build-assessment.md`: 基于当前 macOS 机器的 `Mooncake` 本地可编译性评估
 - `docs/fast26-ai-and-llms-analysis.md`: FAST 2026 `AI and LLMs` session 的 9 篇论文中文分析报告
+- `docs/mooncake-kvcache-prefix-scenario-analysis.md`: `prefix cache` 复用、`PD` 分离、网络平面和存储节点硬件优化的场景分析
 
 ## Projects
 
