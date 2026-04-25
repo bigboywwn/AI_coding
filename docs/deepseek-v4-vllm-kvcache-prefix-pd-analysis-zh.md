@@ -212,7 +212,108 @@ flowchart TB
 
 这个设计解决了一个老问题：vLLM 的 KV manager 原先更偏向“同类 layer 使用同样 page size”。V4 里不同 layer 可能有不同压缩率、不同 SWA 形态、不同 page size，因此 PR 用 `UniformTypeKVCacheSpecs` + page-size bucket + layer tuple 的方式把它们放进统一的 memory planning 模型。
 
-### 3.5 Scheduler block size 与 Hash block size 分离
+更准确地说，V4-Pro 的 61 层并不是“所有层都有同一种 KV”。论文中前面层和后续层的 attention 类型不同，后续层中 `CSA` 与 `HCA` 交错；因此 KV layout 必须是 layer-aware 的：
+
+- `CSA` 层有 `compress_ratio=4` 的 main KV，并且有 DSA 需要的 indexer KV。
+- `HCA` 层有 `compress_ratio=128` 的 compressed main KV，通常不需要 lightning indexer KV。
+- `SWA` 是每层 attention 都要结合的最近窗口状态，但它的长期保存策略和 classical KV 不同。
+- MTP/EAGLE 相关层需要单独标记 `is_eagle_group`，避免 prefix hit 时把 last-block drop 错用到所有 group。
+
+### 3.5 vLLM 如何组织 V4 的物理 Layout
+
+PR #40760 的 layout 组织可以理解为三层：
+
+```text
+KVCacheGroupSpec
+  -> UniformTypeKVCacheSpecs
+      -> per-layer KVCacheSpec
+          -> KVCacheTensor(shared_by=[layer names...])
+```
+
+其中最容易忽略的是：`group` 不是最终物理对象，`layer` 也不是单独一个大对象。vLLM 会把 layer 按 page size 分桶，再按 `layer tuple` 对齐后生成实际的 `KVCacheTensor`。
+
+```mermaid
+flowchart TB
+    A["per-layer KV specs"] --> B["Full MLA specs<br/>CSA/HCA compressed layers"]
+    A --> C["SWA MLA specs<br/>window/cache state layers"]
+    A --> D["Indexer specs<br/>only CSA/DSA layers"]
+
+    B --> E["Bucket by page_size_bytes"]
+    C --> F["Group by (block_size, sliding_window)"]
+    D --> G["Bucket by page_size_bytes"]
+
+    E --> H["Layer tuples"]
+    F --> H
+    G --> H
+
+    H --> I["KVCacheTensor #0<br/>shared_by=[layer_a, layer_b, ...]"]
+    H --> J["KVCacheTensor #1<br/>shared_by=[layer_c, layer_d, ...]"]
+    H --> K["KVCacheTensor #N"]
+```
+
+关键实现点：
+
+- `group_and_unify_kv_cache_specs()` 先把 V4 的 KV specs 拆成 full MLA group 与若干 SWA MLA group。
+- full MLA group 内部仍可能包含不同压缩率的层，例如 CSA 与 HCA；这些层的 `page_size_bytes` 不同，因此需要 `UniformTypeKVCacheSpecs` 保留 per-layer spec。
+- `_get_kv_cache_groups_uniform_groups()` 会为 SWA group 做 page-size padding，使 SWA group 的 page size 能对齐到 full MLA group 的 page-size bucket。
+- `_get_kv_cache_config_deepseek_v4()` 会先取 full MLA group 的 page size 集合作为 canonical bucket set，然后对每个 group 的 layer 按 page size 分桶。
+- 实际分配时，vLLM 为每个 `(tuple_idx, page_size_bucket)` 生成一个 `KVCacheTensor`，它的 `shared_by` 是所有 group 在该 tuple/bucket 上对应 layer 的并集。
+- worker 端 reshape 时，如果 `page_size_padded` 非空，会用 `torch.as_strided()` 建 view；Mooncake 注册 RDMA 内存时也必须按 `stride(0)` 计算 block 长度。
+
+用一个简化例子表示：
+
+```yaml
+full_mla_group:
+  page_size_buckets:
+    37376:
+      - layer.2.csa_main
+      - layer.4.csa_main
+      - layer.6.csa_main
+    1168:
+      - layer.3.hca_main
+      - layer.5.hca_main
+      - layer.7.hca_main
+
+swa_group:
+  page_size_buckets_after_padding:
+    37376:
+      - layer.2.swa_cache
+      - layer.4.swa_cache
+    1168:
+      - padded_empty_or_smaller_swa_tuple
+
+allocated_tensors:
+  - tuple_idx: 0
+    page_size_bucket: 37376
+    shared_by:
+      - layer.2.csa_main
+      - layer.2.swa_cache
+  - tuple_idx: 0
+    page_size_bucket: 1168
+    shared_by:
+      - layer.3.hca_main
+  - tuple_idx: 1
+    page_size_bucket: 37376
+    shared_by:
+      - layer.4.csa_main
+      - layer.4.swa_cache
+```
+
+上面只是说明 layout 形态，不代表 PR 中实际 layer id 固定如此。工程实现不要硬编码“偶数层是 CSA、奇数层是 HCA”，而应以模型 config 和每层 `KVCacheSpec` 为准。
+
+因此，MooncakeStore 的 manifest 也不能只写：
+
+```text
+prefix -> csa_main / hca_main / swa
+```
+
+而应该写成：
+
+```text
+prefix -> kv_group -> layer_tuple -> layer_segment -> block_range/object_slice
+```
+
+### 3.6 Scheduler block size 与 Hash block size 分离
 
 PR 新增 `resolve_kv_cache_block_sizes()`：
 
@@ -310,7 +411,14 @@ flowchart TB
 
 ### 4.4 Prefix Offload Manifest 建议
 
-MooncakeStore 不应该只看到一个 KV blob，而应该看到一个带 group 语义的 manifest：
+MooncakeStore 不应该只看到一个 KV blob，也不应该只看到粗粒度 `csa_main/hca_main/swa` group。V4-Pro 的 61 层里 CSA/HCA/SWA 不是同质层，vLLM PR 的物理 tensor 又按 page-size bucket 和 layer tuple 组织，因此 manifest 至少需要同时表达：
+
+- 逻辑 prefix 维度：`prefix_hash`、`hash_block_size`、`scheduler_block_size`、`logical_token_range`。
+- KV group 维度：full MLA、SWA MLA、indexer、MTP/EAGLE 等 group。
+- layer tuple 维度：vLLM 实际 allocator 对齐后的 tuple 位置。
+- layer segment 维度：某个 layer 的 `attn_type`、`compress_ratio`、`tensor_name`、`page_size_bytes`、`stride_bytes`、`block_ranges`。
+
+推荐 manifest 形态：
 
 ```yaml
 prefix_object:
@@ -320,30 +428,86 @@ prefix_object:
   hash_block_size: 64
   scheduler_block_size: 256
   logical_token_range: [0, 8192)
-  groups:
-    - name: csa_main
-      compress_ratio: 4
+  kv_groups:
+    - group_id: 0
+      role: full_mla_compressed
       logical_block_size: 256
-      storage_block_size: 64
-      entry_bytes: 584
-      page_size_bytes: 37376
-      stride_bytes: 37440
-    - name: csa_indexer
-      compress_ratio: 4
+      layer_tuples:
+        - tuple_id: 0
+          page_size_bucket: 37376
+          tensor_id: kv_tensor_0
+          shared_by:
+            - model.layers.2.self_attn.mla_attn
+            - model.layers.2.self_attn.swa_cache
+          layer_segments:
+            - layer_id: 2
+              attn_type: CSA
+              segment: csa_main
+              tensor_name: model.layers.2.self_attn.mla_attn
+              compress_ratio: 4
+              storage_block_size: 64
+              entry_bytes: 584
+              page_size_bytes: 37376
+              stride_bytes: 37440
+              block_ranges:
+                - logical_tokens: [0, 8192)
+                  block_ids: [10, 11, 12]
+                  object_uri: mooncake://kv/prefix/.../g0/t0/l2/csa_main
+        - tuple_id: 0
+          page_size_bucket: 1168
+          tensor_id: kv_tensor_1
+          shared_by:
+            - model.layers.3.self_attn.mla_attn
+          layer_segments:
+            - layer_id: 3
+              attn_type: HCA
+              segment: hca_main
+              tensor_name: model.layers.3.self_attn.mla_attn
+              compress_ratio: 128
+              storage_block_size: 2
+              entry_bytes: 584
+              page_size_bytes: 1168
+              stride_bytes: 1152
+              block_ranges:
+                - logical_tokens: [0, 8192)
+                  block_ids: [20, 21, 22]
+                  object_uri: mooncake://kv/prefix/.../g0/t0/l3/hca_main
+    - group_id: 1
+      role: csa_indexer
       logical_block_size: 256
-      storage_block_size: 64
-      entry_bytes: 132
-      page_size_bytes: 8448
-      stride_bytes: 8640
-    - name: hca_main
-      compress_ratio: 128
-      logical_block_size: 256
-      storage_block_size: 2
-      entry_bytes: 584
-    - name: swa
+      layer_tuples:
+        - tuple_id: 0
+          page_size_bucket: 8640
+          tensor_id: kv_tensor_2
+          layer_segments:
+            - layer_id: 2
+              attn_type: CSA
+              segment: csa_indexer
+              tensor_name: model.layers.2.self_attn.indexer.k_cache
+              compress_ratio: 4
+              storage_block_size: 64
+              entry_bytes: 132
+              page_size_bytes: 8448
+              stride_bytes: 8640
+              block_ranges:
+                - logical_tokens: [0, 8192)
+                  block_ids: [30, 31, 32]
+                  object_uri: mooncake://kv/prefix/.../g1/t0/l2/csa_indexer
+    - group_id: 2
+      role: swa_mla
       policy: window_only
       sliding_window: 128
       block_size: 64
+      layer_segments:
+        - layer_id: 2
+          segment: swa_window
+          tensor_name: model.layers.2.self_attn.swa_cache
+          page_size_bytes: 37376
+          stride_bytes: 37440
+          block_ranges:
+            - logical_tokens: [8064, 8192)
+              block_ids: [90, 91]
+              object_uri: mooncake://kv/prefix/.../g2/l2/swa
 ```
 
 其中 `stride_bytes` 很重要。PR 已经把 Mooncake connector 的 block length 计算从 shape size 改成：
@@ -353,6 +517,13 @@ block_len = cache.stride(0) * cache.element_size()
 ```
 
 原因是 V4 MLA cache 可能有 alignment/padding，RDMA 传输必须覆盖真实 block 跨度。
+
+上面的 layer id 仅用于说明层级关系，不应作为固定规则。实际实现应从 vLLM 的 `kv_cache_config.kv_cache_groups`、`KVCacheTensor.shared_by` 和每层 `KVCacheSpec` 生成 manifest。尤其需要注意：
+
+- `CSA main` 和 `CSA indexer` 应按同一 `logical_token_range` 和 prefix frontier 绑定生命周期，但可以是不同 physical segment。
+- `HCA main` 只存在于 HCA 层，不需要 indexer KV。
+- `SWA window` 可以跨很多层存在，但 offload 策略应 window-only 或 recompute-friendly。
+- 对 PD 传输来说，`block_ids_by_group` 还不够；真正持久化和恢复时需要能定位到 group 内的 layer segment。
 
 ### 4.5 Prefix Offload 恢复流程
 
@@ -566,13 +737,13 @@ flowchart LR
 
 | 能力 | 说明 |
 |---|---|
-| Group-aware object manifest | 一个 prefix 对象包含多个 KV group segment |
+| Layer-aware object manifest | 一个 prefix 对象包含多个 KV group、layer tuple 与 layer segment |
 | Compression-aware metadata | 记录 `compress_ratio`、`storage_block_size`、entry bytes |
 | Hash/block 分离 | 记录 `hash_block_size` 与 physical group block size 的关系 |
 | Stride-aware transfer | 记录或推导真实 `stride_bytes`，避免 padding 丢失 |
 | SWA policy | 支持 `window_only`、`periodic_checkpoint`、`zero/recompute` 策略 |
 | Indexer KV 生命周期 | indexer KV 与 CSA main KV 同 prefix frontier 管理 |
-| Partial group restore | 允许只恢复某些 group 的尾部缺失 blocks |
+| Partial segment restore | 允许只恢复某些 group/layer segment 的尾部缺失 blocks |
 | Layout versioning | V4 PR 的 cache layout 可能变化，必须版本化 |
 
 ## 7. 从论文到 vLLM PR 的映射关系
@@ -604,14 +775,35 @@ classDiagram
       logical_token_range
     }
 
-    class KVGroupSegment {
-      group_name
-      compress_ratio
+    class KVGroup {
+      group_id
+      role
       logical_block_size
+      hash_block_size
+      scheduler_block_size
+    }
+
+    class LayerTuple {
+      tuple_id
+      page_size_bucket
+      tensor_id
+      shared_by
+    }
+
+    class LayerSegment {
+      layer_id
+      attn_type
+      segment
+      tensor_name
+      compress_ratio
       storage_block_size
       entry_bytes
       page_size_bytes
       stride_bytes
+    }
+
+    class BlockRange {
+      logical_tokens
       block_ids
       storage_uri
     }
@@ -623,22 +815,27 @@ classDiagram
       swa_policy
     }
 
-    PrefixKVObject "1" --> "*" KVGroupSegment
+    PrefixKVObject "1" --> "*" KVGroup
+    KVGroup "1" --> "*" LayerTuple
+    LayerTuple "1" --> "*" LayerSegment
+    LayerSegment "1" --> "*" BlockRange
     PrefixKVObject "1" --> "1" RestorePlan
 ```
+
+这套结构比 `PrefixKVObject -> KVGroupSegment` 多两层，原因是 DeepSeek-V4 的物理 layout 同时依赖“层类型”和“vLLM allocator 的 tuple/bucket 位置”。如果 Store 只知道 `csa_main` 这个 group，而不知道具体 layer/tensor，就无法安全恢复 vLLM 的 `KVCacheTensor.shared_by` 布局，也无法在 PD 场景下准确裁剪某个 group 内的部分 layer segment。
 
 ### 8.2 写入策略
 
 - Prefill 完成或 prefix 达到稳定边界后，写入 classical KV group。
-- CSA main 与 CSA indexer 使用同一 logical block range 和 prefix hash。
-- HCA main 虽然很小，也应与同一 prefix object 绑定。
-- SWA 只写最近窗口，或者不写并标记为 recompute。
+- CSA main 与 CSA indexer 使用同一 logical block range 和 prefix hash，但分别写入对应 layer segment。
+- HCA main 虽然很小，也应与同一 prefix object 绑定，但只出现在 HCA layer segment 中。
+- SWA 只写最近窗口，或者不写并标记为 recompute；如果写入，也要记录对应 layer segment 和窗口 token range。
 - Tail state 默认不长期写入，除非业务需要极低首 token latency。
 
 ### 8.3 读取策略
 
 - 先用 `hash_block_size` 查 prefix object。
-- 根据各 group manifest 判断可恢复到的 common prefix frontier。
+- 根据各 group/layer tuple/layer segment manifest 判断可恢复到的 common prefix frontier。
 - 对缺失 group 做 partial restore 或 replay。
 - 对 SWA 根据策略恢复最近窗口。
 - 恢复后构造 vLLM 需要的 block table、compressed slot mapping、SWA indices、indexer metadata。
@@ -673,4 +870,3 @@ classDiagram
 6. 在 PD connector 中按 group 做 partial hit trimming，再 flatten RDMA ranges。
 7. 在 prefix lookup 中返回 common prefix frontier，而不是单一 hit block 数。
 8. 增加 layout version 校验，防止不同 vLLM/DeepSeek-V4 PR 版本的 KVCache 混用。
-
