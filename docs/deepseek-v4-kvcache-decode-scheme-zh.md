@@ -29,7 +29,7 @@ vLLM 对 DeepSeek-V4 的 KVCache 管理不是把所有层压成一个传统 page
 核心变化有四个：
 
 - `compress_ratio` 决定每层是 SWA-only、C4A 还是 C128A。
-- 主 compressed KV、SWA KV、indexer KV、compressor state cache 都是独立的 cache layer。
+- 主 compressed KV、SWA KV、indexer KV 是需要重点管理的 KV 对象；compressor state cache 是压缩过程的短窗口运行时状态，不应和长期 KV / prefix offload 对象混在一起描述。
 - vLLM 统一使用逻辑 `block_size=256` 作为上层块粒度，但压缩 KV 的真实 `storage_block_size = block_size / compress_ratio`。
 - Prefix cache 命中由 `HybridKVCacheCoordinator` 在多个 KV group 之间求共同可复用前缀，最终命中长度必须按所有 group 的块粒度对齐。
 
@@ -38,8 +38,8 @@ vLLM 对 DeepSeek-V4 的 KVCache 管理不是把所有层压成一个传统 page
 `DeepseekV4Attention` 从 HF config 读取 `compress_ratios[layer_id]`：
 
 - `compress_ratio <= 1`：SWA-only layer，没有自己的 main compressed KV。
-- `compress_ratio == 4`：C4A layer，有 main compressed KV、SWA KV、indexer KV、main compressor state、indexer compressor state。
-- `compress_ratio == 128`：C128A layer，有 main compressed KV、SWA KV、main compressor state，没有 indexer。
+- `compress_ratio == 4`：C4A layer，有 main compressed KV、SWA KV、indexer KV；另有 main/indexer compressor state 用于生成 compressed KV。
+- `compress_ratio == 128`：C128A layer，有 main compressed KV、SWA KV；另有 main compressor state，没有 indexer。
 
 源码依据：
 
@@ -53,8 +53,10 @@ vLLM 对 DeepSeek-V4 的 KVCache 管理不是把所有层压成一个传统 page
 flowchart TB
     L["DeepSeek-V4 layer"] --> R{"compress_ratio"}
     R -->|"<=1"| S["SWA-only\nDeepseekV4SWACache"]
-    R -->|"4"| C4["C4A\nMain compressed KV\nIndexer KV\nSWA KV\nCompressor states"]
-    R -->|"128"| C128["C128A\nMain compressed KV\nSWA KV\nCompressor state"]
+    R -->|"4"| C4["C4A\nMain compressed KV\nIndexer KV\nSWA KV"]
+    R -->|"128"| C128["C128A\nMain compressed KV\nSWA KV"]
+    C4 -.-> ST4["Short-lived\ncompressor states"]
+    C128 -.-> ST128["Short-lived\ncompressor state"]
 ```
 
 ## 3. 单页内存布局
@@ -137,20 +139,45 @@ padded_page_size = 8,640B
 
 如果启用 FP4 indexer cache，源码注释说明仍按 FP8 indexer cache 申请同样大小，只使用前半部分空间。
 
-### 3.4 Compressor state cache
+### 3.4 Compressor state cache 是短窗口状态
 
-DeepSeek-V4 的 compressor 也有 state cache，用 `SlidingWindowMLASpec` 管理，并通过 576B 对齐以便和对应 KV bucket 打包。
+DeepSeek-V4 的 compressor 也有 state cache，但它不是最终 attention 要复用的 compressed KV。它保存的是生成 compressed KV 之前的中间状态：
+
+```text
+state_cache = [kv_state, score_state]
+```
+
+`DeepseekCompressor.forward()` 先把每个原始 token 的 `kv` 与 `score + APE` 写入 state cache，然后 fused kernel 在压缩边界读取最近一小段 state，做 softmax 加权、RMSNorm、RoPE、量化，最后写入 main compressed KV 或 indexer KV。
+
+因此它的定位更接近“压缩工作区 / 短窗口 state cache”，不是 prefix offload 时必须长期保存的 KV history。
 
 源码依据：
 
 - `deepseek_compressor.py`: `CompressorStateCache`
+- `deepseek_compressor.py`: `state_dim=2 * coff * head_dim`，注释为 `kv_state + score_state`
+- `deepseek_compressor.py`: `_save_partial_states_kernel` 写入 `[kv_state, score_state]`
 - C4 main compressor state：`block_size=4`，`state_dim=2048`，约 32,768B，padding 到 32,832B。
 - C128 main compressor state：`block_size=8`，`state_dim=1024`，约 32,768B，padding 到 32,832B。
 - C4 indexer compressor state：`block_size=4`，`state_dim=512`，约 8,192B，padding 到 8,640B。
 
+为什么 C4 main compressor state 看起来很大：
+
+```text
+head_dim = 512
+compress_ratio = 4
+overlap = true
+coff = 2
+state_dim = 2 * coff * head_dim = 2048 fp32
+每个原始 token = 2048 * 4 = 8192B
+state block_size = 4
+每页 = 4 * 8192 = 32768B
+```
+
+这里“大”是因为 state 用 fp32 保存压缩中间量，并且 C4 有 overlap；但它的窗口很短。`CompressorStateCache` 使用 `SlidingWindowMLASpec`，C4 的 `sliding_window = coff * compress_ratio = 8`，所以它不会像 main compressed KV 那样随整段上下文长期增长。
+
 ## 4. vLLM 的 tuple / bucket 物理布局
 
-DeepSeek-V4 的 page size 明显不统一。vLLM 没有直接给每层单独建完全独立的 allocator，而是在 `kv_cache_utils.py` 中走 DeepSeek-V4 专用分支：
+DeepSeek-V4 的长期 KV page size 明显不统一。vLLM 没有直接给每层单独建完全独立的 allocator，而是在 `kv_cache_utils.py` 中走 DeepSeek-V4 专用分支：
 
 ```text
 group_and_unify_kv_cache_specs()
@@ -161,9 +188,11 @@ _get_kv_cache_config_deepseek_v4()
 关键概念：
 
 - `UniformTypeKVCacheSpecs`：一组“需要同样 token slot 数”的 KV spec，但每个 layer 的 page size 可以不同。
-- `page bucket`：按 `page_size_bytes` 把 layer 分桶，例如 1,728B、8,640B、32,832B、37,440B。
+- `page bucket`：按 `page_size_bytes` 把 layer 分桶，例如 1,728B、8,640B、37,440B。
 - `layer tuple`：由不同 page bucket 中同一 tuple index 的若干 layer 组成。
 - `KVCacheTensor`：vLLM 最终分配的物理 tensor，粒度是 `(tuple_idx, page_size_bucket)`。
+
+注意：`CompressorStateCache` 在源码实现上也是 `KVCacheSpec` 支撑的 cache layer，因为它需要 block table 和 slot mapping 来跨 token 保存短窗口状态；但在架构文档里应单独放在 state plane，而不是和 main/indexer/SWA 这些 attention KV 一起画成长期 layer tuple。下面的图只表达长期/召回价值最高的 KV 对象。
 
 源码里的 allocator 逻辑是：
 
@@ -184,29 +213,35 @@ for tuple_idx in range(num_layer_tuples):
 flowchart TB
     subgraph T0["layer tuple 0"]
         P1["bucket 1,728B\nC128A main KV"]
-        P2["bucket 8,640B\nC4A indexer KV / indexer state"]
-        P3["bucket 32,832B\nmain compressor state"]
-        P4["bucket 37,440B\nC4A main KV / SWA KV"]
+        P2["bucket 8,640B\nC4A indexer KV"]
+        P3["bucket 37,440B\nC4A main KV / SWA KV"]
     end
 
     subgraph T1["layer tuple 1"]
         Q1["bucket 1,728B"]
         Q2["bucket 8,640B"]
-        Q3["bucket 32,832B"]
-        Q4["bucket 37,440B"]
+        Q3["bucket 37,440B"]
     end
 
     P1 --> B["BlockPool physical blocks"]
     P2 --> B
     P3 --> B
-    P4 --> B
     Q1 --> B
     Q2 --> B
     Q3 --> B
-    Q4 --> B
 ```
 
 这就是官方 blog 中“Keeping the KV Cache Memory Packed”的源码落点：不是让所有 layer 变成同一种 KV，而是把不同大小的页对齐进同一个 tuple/bucket 体系，减少碎片和 padding。
+
+短窗口 state plane 可以单独理解为：
+
+```mermaid
+flowchart LR
+    X["原始 token hidden"] --> A["wkv / wgate projection"]
+    A --> S["Compressor state cache\nkv_state + score_state\nshort sliding window"]
+    S --> C["compress + norm + rope + quant"]
+    C --> M["Main compressed KV\n或 Indexer KV"]
+```
 
 ## 5. Block、slot 与压缩位置
 
@@ -282,7 +317,7 @@ DeepSeek-V4 是多 KV group 模型，因此 prefix 复用走 `HybridKVCacheCoord
 
 ### 7.1 为什么不能只看一个 group
 
-一个 token prefix 要被认为“可复用”，需要所有相关 KV group 都能在对应块边界上命中。C4A main、C4A indexer、C128A main、SWA、compressor state 的 block size 不完全相同，所以 vLLM 需要求共同命中长度。
+一个 token prefix 要被认为“可复用”，需要相关 KV group 都能在对应块边界上命中。对长期 KV 复用而言，关键对象是 C4A main、C4A indexer、C128A main 与 SWA 窗口；compressor state 是短窗口中间状态，通常应通过尾部 replay 重建，而不是作为长前缀 offload 的主对象。
 
 `HybridKVCacheCoordinator` 做了三件事：
 
@@ -301,7 +336,7 @@ flowchart TB
     C --> D["HybridKVCacheCoordinator.find_longest_cache_hit"]
     D --> E["Full/MLA group 左到右查连续 prefix"]
     D --> F["SWA/Sliding group 右到左查窗口所需连续块"]
-    D --> G["其他 state/cache group 按自身 block size 查"]
+    D --> G["其他短窗口 cache group\n按自身窗口语义处理"]
     E --> H["收缩 hit_length"]
     F --> H
     G --> H
@@ -350,9 +385,10 @@ DeepSeek-V4 在 vLLM 中变成：
 同一 layer 可拥有多个 cache 对象
 main compressed KV 与 SWA KV 同时存在
 C4A 额外拥有 indexer KV
+compressor state 是短窗口压缩状态，不等同于长期 KV
 compressed slot mapping 与原始 slot mapping 不同
 多个 KV group 必须共同决定 prefix hit length
-物理内存按 tuple_idx + page_size_bucket 分配
+长期 KV 主对象按 tuple_idx + page_size_bucket 组织物理页
 ```
 
 ## 9. 对 Prefix Offload / Mooncake 的要求
@@ -364,7 +400,7 @@ compressed slot mapping 与原始 slot mapping 不同
 - `model_version = deepseek_v4`
 - `kv_group_id`
 - `layer_name`
-- `object_kind`: `main_compressed_kv`、`swa_kv`、`indexer_kv`、`compressor_state`
+- `object_kind`: `main_compressed_kv`、`swa_kv`、`indexer_kv`
 - `compress_ratio`
 - `logical_block_size`
 - `storage_block_size`
@@ -380,6 +416,7 @@ compressed slot mapping 与原始 slot mapping 不同
 - 先按 `HybridKVCacheCoordinator` 能接受的 hit length 裁剪 prefix。
 - 对 C4A 同时召回 main compressed KV 和 indexer KV。
 - 对 SWA 只召回窗口所需块，长历史可用 null blocks 表示。
+- 对 compressor state 默认不做长期 offload；需要时只把它当作短窗口 checkpoint，或者通过 replay 尾部 token 重建。
 - 对 compressed KV 使用 compressed slot mapping，而不是原始 slot mapping。
 - 外部存储的对象大小应按 `page_size_bytes`，不是按 `real_page_size_bytes`，否则会破坏 vLLM 的 page/bucket 对齐。
 
@@ -398,7 +435,10 @@ flowchart TB
         I4["C4A indexer KV\n64 * 132 -> 8,640B"]
         M128["C128A main KV\n2 * 584 -> 1,728B"]
         SW["SWA KV\n64 * 584 -> 37,440B"]
-        ST["Compressor state\nbucket aligned"]
+    end
+
+    subgraph State["Short-lived state"]
+        ST["Compressor state\nkv_state + score_state\nshort window / replayable"]
     end
 
     subgraph Layout["Physical layout"]
@@ -417,19 +457,19 @@ flowchart TB
     C4 --> M4
     C4 --> I4
     C4 --> SW
-    C4 --> ST
     C128 --> M128
     C128 --> SW
-    C128 --> ST
     S --> SW
+    C4 -.-> ST
+    C128 -.-> ST
 
     M4 --> T
     I4 --> T
     M128 --> T
     SW --> T
-    ST --> T
     T --> B
     B --> P
+    ST -.->|"非长期 prefix/offload 主对象"| HC
 
     H --> HC
     HC --> LCM
@@ -448,4 +488,5 @@ DeepSeek-V4 的 KVCache 复用原则仍然是“前缀可复用”，但在 vLLM
 
 - 不保存 C4A indexer KV，只保存 main KV，会导致 decode DSA 无法直接复用 prefix。
 - 按原始 slot mapping 写 indexer KV，会在跨 storage block 时写错位置。
+- 把 compressor state 当成长期 KV 保存，会高估 offload 价值并复杂化召回；它更适合作为短窗口 checkpoint 或通过尾部 replay 重建。
 - 外部 offload 如果忽略 `page_size_bytes` padding 和 tuple/bucket layout，会导致召回后 block table 能命中但内存内容不符合 vLLM kernel 预期。
