@@ -9,7 +9,7 @@
 | HBM 驻留 | 当前层所需的前缀、已完成 chunk 和当前 chunk 的 KV | 每层保留历史热槽和两个轮转尾块 | 按预算保留前向输出和提前调回的张量，另有指定常驻的算子输出 | 权重表驻留 Host DDR，GPU 持有表描述符、行号和本次查询的输出 |
 | Store 空间布局 | 同一块的兼容层聚合为一个对象 | DDR 按层、按分量划区，同组各层共用块号 | 实际换出时为每个张量载荷分配变长、对齐的锁页 DDR 区间 | 每个 Engram 层一张逻辑定宽表，按行切给 TP rank，行内打包权重与 scale |
 | 读写语义 | 按 key 整块或按层区间读写 | 写完整块，按请求内 token 位置读当前层的行 | 前向 `put(tensor) → handle`，反向重计算 `pop(handle) → tensor`，消费后释放 | 整表一次发布，推理时按表和行号批量读，权重跨请求复用 |
-| I/O 粒度与时限 | 聚合多个 token 的块或层区间，在当前层使用前读就绪 | 多个离散的小行，Top‑K 选出后尽快填入热槽 | 按完整张量载荷双向搬运，预取要赶在对应算子开始重放之前 | 每个有效 token、每个 Engram 层 **24 个离散的 264 B 行读**，同层门控前就绪 |
+| I/O 粒度与时限 | 聚合多个 token 的块或层区间，在当前层使用前读就绪 | 当前层有 M 个 Top‑K miss 时，每个独立存储的 KV 分量各读 M 个离散源地址，填入对应热槽 | 按完整张量载荷双向搬运，预取要赶在对应算子开始重放之前 | 每个有效 token、每个 Engram 层 **24 个离散源地址，每址读 264 B**，同层门控前就绪 |
 | 元数据查询 | key 定位对象和可读状态 | NPU 查 token 驻留映射及请求块表 | 训练运行时用算子调用记录找到句柄，Store 用句柄定位驻留副本及 DDR 区间 | 按表缓存基址和布局，设备用本地行号乘行宽定位 |
 
 ## Prefill 与 Decode DSA 的 HBM 驻留差异
@@ -46,10 +46,10 @@
 
 以 GLM‑5.3 的一层为例，CKV 每个 token 有 512 个元素，KPE 有 64 个。Prefill 按层搬运一个完整的 128-token 块时，各分量在块内聚合。Decode DSA 一次 miss 只需取回同层一个 token 的两个分量。下表按两个源区间分别列出有效字节数。[模型配置](https://huggingface.co/zai-org/GLM-5.3/raw/main/config.json) · [按层区间计算](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/layerwise/kv_transfer.py#L447-L475) · [Decode 分量读取](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/csrc/attention/fused_scatter_copy_sparse_flash_attention/op_kernel/first_fill_scatter_copy_kernel.h#L183-L193)
 
-| 主 KV 精度 | Prefill 单层完整块，128 个 token（CKV + KPE） | Decode 单层一次 miss，1 个 token（CKV + KPE） |
+| 主 KV 精度 | Prefill 单层完整块，128 个 token（CKV + KPE） | Decode 单层一次 miss，1 个 token（两个独立源地址） |
 | --- | ---: | ---: |
-| BF16（当前 Decode 实现） | 128 KiB + 16 KiB | 1024 B + 128 B |
-| FP8（按每元素 1 B 估算，量化 scale 另计） | 64 KiB + 8 KiB | 512 B + 64 B |
+| BF16（当前 Decode 实现） | 128 KiB + 16 KiB | CKV 地址读 1024 B，KPE 地址读 128 B |
+| FP8（按每元素 1 B 估算，量化 scale 另计） | 64 KiB + 8 KiB | CKV 地址读 512 B，KPE 地址读 64 B |
 
 128 个 token 是本例的完整块大小，部分块或较短的 range 可产生更小的 Prefill I/O。Decode 需要支持小于 1 KiB 的离散读区间，例如 BF16 的 KPE 为 128 B，同次召回的 CKV 恰为 1 KiB。实际链路分包由传输实现决定。
 
@@ -195,14 +195,18 @@ CKV 源地址 = CKV_base[layer] + 物理行号 × CKV 每行字节数
 KPE 源地址 = KPE_base[layer] + 物理行号 × KPE 每行字节数
 ```
 
-### 5. 单个 token 召回产生两个小读区间
+### 5. 每层召回的离散源地址数与每址读取长度
 
-GLM‑5.3 的 CKV 为 512 维，KPE 为 64 维。下表按一个 token 在一层的有效数据量计算。当前实现要求主 KV 使用 BF16；FP8 一行用于估算两个分量都按 1 字节存储时的读粒度，量化 scale 另计。表中的两段对应两个源地址区间，实际链路包数取决于传输实现。[GLM‑5.3 配置](https://huggingface.co/zai-org/GLM-5.3/raw/main/config.json) · [BF16 类型检查](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py#L815-L828) · [两次分量读取](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/csrc/attention/fused_scatter_copy_sparse_flash_attention/op_kernel/first_fill_scatter_copy_kernel.h#L183-L193)
+设 M 为一个请求在当前 Decode step、当前层的 Top‑K 中实际需要从 DDR 召回的历史 token 数。每个 miss 的源地址数取决于该层的 KV 行布局。
 
-| 主 KV 精度 | CKV 读区间 | KPE 读区间 | 单层、单 token 合计 |
-| --- | ---: | ---: | ---: |
-| BF16（当前实现） | 1024 B | 128 B | 1152 B |
-| FP8（估算） | 512 B | 64 B | 576 B |
+| DDR 中的行布局 | 当前层 M 个 miss 的逻辑读取 |
+| --- | --- |
+| GLM‑5.3，vLLM-Ascend 当前 BF16 分量分存路径 | CKV 的 M 个离散源地址各读 1024 B，KPE 的另 M 个离散源地址各读 128 B |
+| 同样分存，假设 CKV、KPE 均为 FP8，scale 另计 | CKV 的 M 个离散源地址各读 512 B，KPE 的另 M 个离散源地址各读 64 B |
+| 以 DeepSeek-V3.2 的 FlashMLA FP8 打包格式作为 DDR 行布局 | M 个离散源地址，每址读 656 B（行内含 512 B 量化数据、16 B scale、128 B BF16 RoPE） |
+| 假设 512 B CKV 和 64 B KPE 紧邻打包，读取区间内无额外字段 | M 个离散源地址，每址读 576 B |
+
+分存示例按 vLLM-Ascend 的两个分量基址寻址。打包示例按整行召回描述 Store 粒度，实际链路事务数取决于传输实现。[GLM‑5.3 配置](https://huggingface.co/zai-org/GLM-5.3/raw/main/config.json) · [BF16 类型检查](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py#L815-L828) · [两次分量读取](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/csrc/attention/fused_scatter_copy_sparse_flash_attention/op_kernel/first_fill_scatter_copy_kernel.h#L183-L193) · [FlashMLA 的 656 B 行格式](https://github.com/vllm-project/vllm/blob/ebf862c351dc4bcaf65de34c3caebe6df6e9e214/vllm/v1/attention/backends/mla/flashmla_sparse.py#L71-L80)
 
 ## 训练激活卸载的 DDR Store（MindSpeed-MM OpReplay）
 
@@ -216,14 +220,13 @@ OpReplay 保存一次前向算子调用的输出，供同一训练步的反向�
 
 ## Engram 只读权重表（DeepSeek-V4.1-Flash）
 
-**一个有效文本 token 在一个 Engram 层触发 24 个离散的 264 B 逻辑行读。** 模型对截至该位置的 2-gram、3-gram 和 4-gram 各用 8 个 Engram 哈希 head，每个 head 选一行。40 个主模型层中，层 ID 1 和 14 各自使用一张表。查回的向量经门控加入隐藏状态，随后本层照常计算 Attention。[模型配置](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/raw/main/config.json) · [官方前向代码](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/model.py#L1159-L1165)
+**一个有效文本 token 在一个 Engram 层读取 24 个离散源地址，每个地址读 264 B。** 模型对截至该位置的 2-gram、3-gram 和 4-gram 各用 8 个 Engram 哈希 head，每个 head 选一行。40 个主模型层中，层 ID 1 和 14 各自使用一张表。查回的向量经门控加入隐藏状态，随后本层照常计算 Attention。[模型配置](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/raw/main/config.json) · [官方前向代码](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/model.py#L1159-L1165)
 
 **写入与寻址。** 在 SGLang 配套 PR 的 Mooncake 适配中，每层的逻辑表按行在 TP rank 间切分，加载时将本地分片发布成连续的只读字节表。每行包含 256 B FP8 权重，以及 8 B E8M0 scale（每 32 个权重共用一个 scale）。设备用 `本地表基址 + 本地行号 × 264 B` 取出整行。[SGLang 分片与行打包](https://github.com/sgl-project/sglang/pull/44521/files) · [Mooncake 整表发布](https://github.com/kvcache-ai/Mooncake/blob/e46d3389f2db506383ce727f739baf948bb4f0d4/python/mooncake/engram.py#L95-L126)
 
-| 每个有效文本 token 的统计范围 | 逻辑行读数 | 有效载荷 |
+| 每个有效文本 token | 离散源地址数 | 每址读取长度 |
 | --- | ---: | ---: |
-| 一个 Engram 层、一种 n-gram 长度的一个哈希 head | 1 | 264 B |
-| 一个 Engram 层，全部 n-gram 长度和 head | 3 × 8 = 24 | 6,336 B |
-| 两个 Engram 层合计 | 2 × 24 = 48 | 12,672 B（12.375 KiB） |
+| 层 ID 1 的权重表 | 3 × 8 = 24 | 264 B |
+| 层 ID 14 的权重表 | 3 × 8 = 24 | 264 B |
 
-这里的“小包”指 Store 需要读取的离散源区间。行号可批量提交，每个 rank 只读取归属本地的行。表中统计的是汇总各分片的有效载荷，实际总线事务数取决于地址分布和硬件。与 Decode DSA 相比，Engram 在输入 token 确定时就能算出行号，可提前发起读取；DSA 的缺失行要等当前层完成 Top-K 选择和热槽查询才能确定。[设备侧行读取](https://github.com/kvcache-ai/Mooncake/blob/e46d3389f2db506383ce727f739baf948bb4f0d4/mooncake-store/src/engram/engram_local_cuda.cu#L7-L24)
+每层的 24 个地址按模型的全部哈希 head 计。行号可批量提交，各 TP rank 只读取归属本地分片的行。实际总线事务数取决于地址分布和硬件。与 Decode DSA 相比，Engram 在输入 token 确定时就能算出行号，可提前发起读取；DSA 的缺失行要等当前层完成 Top-K 选择和热槽查询才能确定。[设备侧行读取](https://github.com/kvcache-ai/Mooncake/blob/e46d3389f2db506383ce727f739baf948bb4f0d4/mooncake-store/src/engram/engram_local_cuda.cu#L7-L24)
