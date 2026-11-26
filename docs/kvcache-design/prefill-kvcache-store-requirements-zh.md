@@ -1,16 +1,16 @@
-# Prefill、Decode DSA 与训练激活卸载的 Store 原始需求
+# Prefill、Decode DSA、训练激活卸载与 Engram 的 Store 原始需求
 
-**Prefill 按 key 复用跨层聚合的前缀块，Decode DSA 在 NPU 上查表并为缺失的 token 行分配热槽，训练 OpReplay 则按句柄暂存前向算子输出，利用重计算前的时间窗口把完整张量预取回 HBM。**
+**Prefill 按 key 复用跨层聚合的前缀块，Decode DSA 在 NPU 上查表并为缺失的 token 行分配热槽，训练 OpReplay 则按句柄暂存前向算子输出，利用重计算前的时间窗口把完整张量预取回 HBM，Engram 按短语哈希从只读权重表批量取行。**
 
-## 三种场景的 Store 需求对照
+## 四种场景的 Store 需求对照
 
-| 维度 | Prefill | Decode DSA | 训练激活（OpReplay） |
-| --- | --- | --- | --- |
-| HBM 驻留 | 当前层所需的前缀、已完成 chunk 和当前 chunk 的 KV | 每层保留历史热槽和两个轮转尾块 | 按预算保留前向输出和提前调回的张量，另有指定常驻的算子输出 |
-| Store 空间布局 | 同一块的兼容层聚合为一个对象 | DDR 按层、按分量划区，同组各层共用块号 | 实际换出时为每个张量载荷分配变长、对齐的锁页 DDR 区间 |
-| 读写语义 | 按 key 整块或按层区间读写 | 写完整块，按请求内 token 位置读当前层的行 | 前向 `put(tensor) → handle`，反向重计算 `pop(handle) → tensor`，消费后释放 |
-| I/O 粒度与时限 | 聚合多个 token 的块或层区间，在当前层使用前读就绪 | 多个离散的小行，Top‑K 选出后尽快填入热槽 | 按完整张量载荷双向搬运，预取要赶在对应算子开始重放之前 |
-| 元数据查询 | key 定位对象和可读状态 | NPU 查 token 驻留映射及请求块表 | 训练运行时用算子调用记录找到句柄，Store 用句柄定位驻留副本及 DDR 区间 |
+| 维度 | Prefill | Decode DSA | 训练激活（OpReplay） | Engram（DS-V4.1-Flash） |
+| --- | --- | --- | --- | --- |
+| HBM 驻留 | 当前层所需的前缀、已完成 chunk 和当前 chunk 的 KV | 每层保留历史热槽和两个轮转尾块 | 按预算保留前向输出和提前调回的张量，另有指定常驻的算子输出 | 权重表驻留 Host DDR，GPU 持有表描述符、行号和本次查询的输出 |
+| Store 空间布局 | 同一块的兼容层聚合为一个对象 | DDR 按层、按分量划区，同组各层共用块号 | 实际换出时为每个张量载荷分配变长、对齐的锁页 DDR 区间 | 每个 Engram 层一张逻辑定宽表，按行切给 TP rank，行内打包权重与 scale |
+| 读写语义 | 按 key 整块或按层区间读写 | 写完整块，按请求内 token 位置读当前层的行 | 前向 `put(tensor) → handle`，反向重计算 `pop(handle) → tensor`，消费后释放 | 整表一次发布，推理时按表和行号批量读，权重跨请求复用 |
+| I/O 粒度与时限 | 聚合多个 token 的块或层区间，在当前层使用前读就绪 | 多个离散的小行，Top‑K 选出后尽快填入热槽 | 按完整张量载荷双向搬运，预取要赶在对应算子开始重放之前 | 每个有效 token、每个 Engram 层 **24 个离散的 264 B 行读**，同层门控前就绪 |
+| 元数据查询 | key 定位对象和可读状态 | NPU 查 token 驻留映射及请求块表 | 训练运行时用算子调用记录找到句柄，Store 用句柄定位驻留副本及 DDR 区间 | 按表缓存基址和布局，设备用本地行号乘行宽定位 |
 
 ## Prefill 与 Decode DSA 的 HBM 驻留差异
 
@@ -213,3 +213,17 @@ OpReplay 保存一次前向算子调用的输出，供同一训练步的反向�
 3. **读时查找与预取。** 反向重计算先按会话、算子及该算子的调用顺序取出对应句柄。Store 检查驻留状态，已有 HBM 副本时直接使用，只有 DDR 副本时从句柄关联的区间读回。开启预取后，可以利用前一迭代观察到的消费顺序，在 HBM 预算内提前调入。计算流须在回读完成后使用张量，运行时再按原输出结构重建算子结果。[重放取回](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/op_replay.py#L368-L422) · [预取顺序与预算](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/swap_core.py#L681-L732)
 4. **I/O 粒度与布局恢复。** 单次传输对应一个本地张量载荷。以连续 BF16 张量 `[1, 4096, 4096]` 为例，换出为 32 MiB，若之后从 DDR 回读，双向合计 64 MiB。实际字节数取决于本地分片、精度和布局。非连续视图可能需要搬运包含间隙的存储窗口，句柄关联的描述信息需支持恢复形状、步长和偏移。启用载荷量化时，按量化载荷计传输量。[存储窗口与视图恢复](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/slab_arena.py#L104-L137) · [载荷量化](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/swap_core.py#L602-L625)
 5. **消费与空间回收。** `pop` 把张量交给计算方并结束句柄的缓存生命周期。DDR 区间要等相关在途拷贝满足完成依赖后才能复用。若重计算提前停止，运行时清理剩余路由，并在步末回收遗留句柄。容量估算要看同时存活的 DDR 载荷峰值，性能则要看 D2H 能否及时腾出 HBM，以及 H2D 能否在算子消费前完成。[消费与释放](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/swap_core.py#L344-L388) · [提前结束清理](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/op_replay.py#L423-L438) · [步末回收](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/swap_manager.py#L98-L101)
+
+## Engram 只读权重表（DeepSeek-V4.1-Flash）
+
+**一个有效文本 token 在一个 Engram 层触发 24 个离散的 264 B 逻辑行读。** 模型对截至该位置的 2-gram、3-gram 和 4-gram 各用 8 个 Engram 哈希 head，每个 head 选一行。40 个主模型层中，层 ID 1 和 14 各自使用一张表。查回的向量经门控加入隐藏状态，随后本层照常计算 Attention。[模型配置](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/raw/main/config.json) · [官方前向代码](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/inference/model.py#L1159-L1165)
+
+**写入与寻址。** 在 SGLang 配套 PR 的 Mooncake 适配中，每层的逻辑表按行在 TP rank 间切分，加载时将本地分片发布成连续的只读字节表。每行包含 256 B FP8 权重，以及 8 B E8M0 scale（每 32 个权重共用一个 scale）。设备用 `本地表基址 + 本地行号 × 264 B` 取出整行。[SGLang 分片与行打包](https://github.com/sgl-project/sglang/pull/44521/files) · [Mooncake 整表发布](https://github.com/kvcache-ai/Mooncake/blob/e46d3389f2db506383ce727f739baf948bb4f0d4/python/mooncake/engram.py#L95-L126)
+
+| 每个有效文本 token 的统计范围 | 逻辑行读数 | 有效载荷 |
+| --- | ---: | ---: |
+| 一个 Engram 层、一种 n-gram 长度的一个哈希 head | 1 | 264 B |
+| 一个 Engram 层，全部 n-gram 长度和 head | 3 × 8 = 24 | 6,336 B |
+| 两个 Engram 层合计 | 2 × 24 = 48 | 12,672 B（12.375 KiB） |
+
+这里的“小包”指 Store 需要读取的离散源区间。行号可批量提交，每个 rank 只读取归属本地的行。表中统计的是汇总各分片的有效载荷，实际总线事务数取决于地址分布和硬件。与 Decode DSA 相比，Engram 在输入 token 确定时就能算出行号，可提前发起读取；DSA 的缺失行要等当前层完成 Top-K 选择和热槽查询才能确定。[设备侧行读取](https://github.com/kvcache-ai/Mooncake/blob/e46d3389f2db506383ce727f739baf948bb4f0d4/mooncake-store/src/engram/engram_local_cuda.cu#L7-L24)
