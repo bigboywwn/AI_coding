@@ -1,6 +1,16 @@
-# Prefill 与 Decode DSA Offload 的 KVCache Store 原始需求
+# Prefill、Decode DSA 与训练激活卸载的 Store 原始需求
 
-**Prefill 为当前层备齐前缀和当前 chunk 的 KV，按 key 分配、查询跨层聚合的块对象并整块或按层读写，而 Decode DSA 在 HBM 保留热 KV 和尾块，向分层布局的 DDR 整块写回，由 NPU 就地查表、分配热槽，按层召回缺失的单 token 行。**
+**Prefill 按 key 复用跨层聚合的前缀块，Decode DSA 在 NPU 上查表并为缺失的 token 行分配热槽，训练 OpReplay 则按句柄暂存前向算子输出，利用重计算前的时间窗口把完整张量预取回 HBM。**
+
+## 三种场景的 Store 需求对照
+
+| 维度 | Prefill | Decode DSA | 训练激活（OpReplay） |
+| --- | --- | --- | --- |
+| HBM 驻留 | 当前层所需的前缀、已完成 chunk 和当前 chunk 的 KV | 每层保留历史热槽和两个轮转尾块 | 按预算保留前向输出和提前调回的张量，另有指定常驻的算子输出 |
+| Store 空间布局 | 同一块的兼容层聚合为一个对象 | DDR 按层、按分量划区，同组各层共用块号 | 实际换出时为每个张量载荷分配变长、对齐的锁页 DDR 区间 |
+| 读写语义 | 按 key 整块或按层区间读写 | 写完整块，按请求内 token 位置读当前层的行 | 前向 `put(tensor) → handle`，反向重计算 `pop(handle) → tensor`，消费后释放 |
+| I/O 粒度与时限 | 聚合多个 token 的块或层区间，在当前层使用前读就绪 | 多个离散的小行，Top‑K 选出后尽快填入热槽 | 按完整张量载荷双向搬运，预取要赶在对应算子开始重放之前 |
+| 元数据查询 | key 定位对象和可读状态 | NPU 查 token 驻留映射及请求块表 | 训练运行时用算子调用记录找到句柄，Store 用句柄定位驻留副本及 DDR 区间 |
 
 ## Prefill 与 Decode DSA 的 HBM 驻留差异
 
@@ -193,3 +203,13 @@ GLM‑5.3 的 CKV 为 512 维，KPE 为 64 维。下表按一个 token 在一层
 | --- | ---: | ---: | ---: |
 | BF16（当前实现） | 1024 B | 128 B | 1152 B |
 | FP8（估算） | 512 B | 64 B | 576 B |
+
+## 训练激活卸载的 DDR Store（MindSpeed-MM OpReplay）
+
+OpReplay 保存一次前向算子调用的输出，供同一训练步的反向重计算使用。这里的 checkpoint 是需要在反向阶段重新执行的一段前向计算。训练运行时为每次 checkpoint 调用建立独立会话，记录哪些算子的输出可以直接取回。Store 的访问标识是**逻辑句柄**，同一个句柄在张量从 HBM 换到 DDR、再预取回 HBM 的过程中始终有效，直至消费或清理。[会话与调用路由](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/op_replay.py#L457-L493)
+
+1. **前向登记与 HBM 驻留。** 白名单算子执行后，运行时把输出结构展开，每个可换出的张量各调用一次 `put` 并保存返回的句柄。同一算子调用两次会生成两条按顺序消费的记录。指定常驻的输出直接保留在 HBM。其他输出先受 HBM 容量预算管理，`put` 返回时张量可能仍在 HBM。[登记算子输出](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/op_replay.py#L322-L359) · [句柄与容量管理](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/swap_core.py#L602-L632)
+2. **写时分配与源 HBM 复用。** 实际换出时才按载荷大小取得一段对齐的锁页 DDR，将该区间关联到句柄。多个张量可共用同一大块内存（slab）中的不同区间。Store 必须使 D2H 排在前向写入之后，同时保证 HBM 源区间的覆盖排在 D2H 读完之后。调用方据此判断何时可复用源空间。[DDR 区间与布局登记](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/slab_arena.py#L326-L365) · [异步写出](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/swap_core.py#L271-L309)
+3. **读时查找与预取。** 反向重计算先按会话、算子及该算子的调用顺序取出对应句柄。Store 检查驻留状态，已有 HBM 副本时直接使用，只有 DDR 副本时从句柄关联的区间读回。开启预取后，可以利用前一迭代观察到的消费顺序，在 HBM 预算内提前调入。计算流须在回读完成后使用张量，运行时再按原输出结构重建算子结果。[重放取回](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/op_replay.py#L368-L422) · [预取顺序与预算](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/swap_core.py#L681-L732)
+4. **I/O 粒度与布局恢复。** 单次传输对应一个本地张量载荷。以连续 BF16 张量 `[1, 4096, 4096]` 为例，换出为 32 MiB，若之后从 DDR 回读，双向合计 64 MiB。实际字节数取决于本地分片、精度和布局。非连续视图可能需要搬运包含间隙的存储窗口，句柄关联的描述信息需支持恢复形状、步长和偏移。启用载荷量化时，按量化载荷计传输量。[存储窗口与视图恢复](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/slab_arena.py#L104-L137) · [载荷量化](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/swap_core.py#L602-L625)
+5. **消费与空间回收。** `pop` 把张量交给计算方并结束句柄的缓存生命周期。DDR 区间要等相关在途拷贝满足完成依赖后才能复用。若重计算提前停止，运行时清理剩余路由，并在步末回收遗留句柄。容量估算要看同时存活的 DDR 载荷峰值，性能则要看 D2H 能否及时腾出 HBM，以及 H2D 能否在算子消费前完成。[消费与释放](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/swap_core.py#L344-L388) · [提前结束清理](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/op_replay.py#L423-L438) · [步末回收](https://gitcode.com/Ascend/MindSpeed-MM/blob/0304ba49ca8bf0ead05c659ca43afb799131269f/mindspeed_mm/fsdp/features/memory/swap_manager.py#L98-L101)
