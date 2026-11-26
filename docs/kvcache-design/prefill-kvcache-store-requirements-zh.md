@@ -1,8 +1,10 @@
-# Prefill KVCache Store 的原始接口需求
+# Prefill 与 Decode DSA Offload 的 KVCache Store 原始需求
+
+## Prefill KVCache Store
 
 以 vLLM-Ascend 对接社区 Mooncake Store 为例。Prefill 写出时，将已生成的 KV 从本地 HBM 存到指定 key。前缀命中时，将该 key 对应的 KV 读回本次请求使用的 HBM 位置。
 
-## 1. HBM 内 KVCache 读写地址的管理
+### 1. HBM 内 KVCache 读写地址的管理
 
 vLLM 的 KV cache manager 为请求分配或复用本地 KV 块，按 cache group 提供块表。vLLM-Ascend 的 connector worker 根据块表中的 `block_id` 和本地张量布局，把一次传输展开为一个或多个 `(HBM 地址, 字节数)`。对于一个 KV 分量，起始地址为 `分量基址 + block_id × 块步长 + 块内字节偏移`。步长决定相邻块的位置，字节数决定本次实际搬多少。[地址计算源码](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py#L477-L515)
 
@@ -10,11 +12,11 @@ vLLM 的 KV cache manager 为请求分配或复用本地 KV 块，按 cache grou
 
 使用 Store 显式注册 HBM 缓冲区时，调用 `register_buffer(buffer_ptr: int, size: int) -> int`。`buffer_ptr` 是缓冲区基址（底层类型 `uintptr_t`），`size` 是整个注册区间的字节数（`size_t`），返回 0 表示注册成功。后续 put/get 可传入该区间内各数据段的起始地址。[Python 绑定](https://github.com/kvcache-ai/Mooncake/blob/b524db2c89c795a0bd1b4df78c307f03f2b853b1/mooncake-integration/store/store_py.cpp#L3199-L3209)
 
-## 2. key 到 HBM 地址的管理
+### 2. key 到 HBM 地址的管理
 
 **本次传输的映射由 vLLM-Ascend connector worker 建立。** 对同一个 cache group 的逻辑块位置 `i`，worker 将该位置的 Store key 与请求块表中的 `block_ids[i]` 配对，再按第 1 节的布局计算 HBM 地址列表。完整前缀块的 key 根据块哈希及模型、并行布局等信息构造。相同 key 在另一次请求中可以读入不同的本地块。Mooncake 在每次数据搬运调用中接收调用方给出的 HBM 地址。[块级配对](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py#L916-L936) · [按层配对及地址展开](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/layerwise/kv_transfer.py#L416-L475)
 
-## 3. put 和 get 都按 key 访问
+### 3. put 和 get 都按 key 访问
 
 | 操作 | key 的含义 | HBM 地址的含义 |
 | --- | --- | --- |
@@ -23,7 +25,7 @@ vLLM 的 KV cache manager 为请求分配或复用本地 KV 块，按 cache grou
 
 接口需支持批量 key 和每个 key 的多段缓冲区。`keys[i]`、`buffers[i]`、`sizes[i]` 描述同一个对象，`buffers[i][j]` 与 `sizes[i][j]` 描述它的第 `j` 段 HBM 数据。调用方需要能判断每个 key 的传输结果。[Mooncake 整对象读写调用](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py#L715-L776)
 
-## 4. block-wise 和 layer-wise 的接口差异
+### 4. block-wise 和 layer-wise 的接口差异
 
 | 接口需求 | block-wise | layer-wise |
 | --- | --- | --- |
@@ -33,7 +35,7 @@ vLLM 的 KV cache manager 为请求分配或复用本地 KV 块，按 cache grou
 
 layer-wise 有两个不同的完成时点。某层 range 写完成，意味着该次传输已读完该层的 HBM 源区间。整个 key 提交成功，意味着块对象已发布可读。共享槽可以据前者安排覆盖，前缀复用依赖后者。[vLLM-Ascend 的接口对应关系](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py#L656-L713) · [社区 Mooncake 接口声明](https://github.com/kvcache-ai/Mooncake/blob/b524db2c89c795a0bd1b4df78c307f03f2b853b1/mooncake-store/include/real_client.h#L268-L305)
 
-### Mooncake Python 接口签名
+#### Mooncake Python 接口签名
 
 以下为 vLLM-Ascend 调用的 Store 实例方法，省略 `self`。默认值取自社区 Mooncake 的 Python 绑定。[绑定源码](https://github.com/kvcache-ai/Mooncake/blob/b524db2c89c795a0bd1b4df78c307f03f2b853b1/mooncake-integration/store/store_py.cpp#L3459-L3594)
 
@@ -80,7 +82,7 @@ def batch_get_into_multi_buffer_ranges(
 def batch_get_session_end(keys: list[str]) -> int: ...
 ```
 
-### 参数与返回值
+#### 参数与返回值
 
 下表中，`i` 是本次调用中 key 的下标，`j` 是该 key 在本次调用中的数据段下标。二维参数的外层长度等于 `len(keys)`。对同一个 `i`，地址、长度和 range 偏移按 `j` 一一对应。
 
@@ -102,3 +104,39 @@ def batch_get_session_end(keys: list[str]) -> int: ...
 | 整块 put，读写 session start，写 session end/revoke | `list[int]` | 每个 key 返回状态码 0。 |
 | 整块 get，range put/get | `list[int]` | 每个 key 返回本次实际传输的字节数。range 调用可与该 key 本次请求的区间总长度 `sum(all_sizes[i])` 核对。 |
 | 读 session end | `int` | 整批返回一个状态码，0 表示成功，负值表示失败。 |
+
+## Decode DSA Offload 的 DDR Store
+
+以下需求对应 vLLM-Ascend 开启 Sparse KV Offload 后的默认 `fused_copy_sfa` 路径。DDR 保存请求的稳定历史 KV。vLLM-Ascend 管理每层的 HBM Top‑K 热槽、请求内 token 位置到热槽的驻留映射，以及两个轮转尾块。[路径选择](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/ascend_config.py#L1844-L1849) · [HBM 空间分配](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py#L114-L159)
+
+### 1. 按层组织读写
+
+同一 cache group 内，各层沿用请求块表中的同一个物理块号。每层分别持有 CKV、KPE 两个 DDR 基址。例如 GLM‑5.3 的 78 个主模型层共用块号 `b`，这个编号在各层分别选中 CKV 和 KPE 的第 `b` 块，合计 156 个数据区间。Attention 只召回当前层的数据，写回时可以批量提交多层的区间。[逐层分配](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/worker/v2/attn_utils.py#L1310-L1325) · [分层记录基址](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py#L892-L928)
+
+### 2. 按完整 block 写入 DDR
+
+新 token 先写入当前层的 HBM 尾块。满足整块写回条件时，按请求块表确定 DDR 目标块号。以每块 128 个 token 为例，单层写出两段连续数据，分别是 128 行 CKV 和 128 行 KPE。各层写回完成后，请求的 `stable_prefix` 才前进一个 block。块表记录写到哪里，`stable_prefix` 记录已经可以从 DDR 读取的历史范围。[写回条件与目标块](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py#L2042-L2080) · [传输长度](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py#L1736-L1760) · [推进可读范围](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py#L1816-L1836)
+
+### 3. 按当前层的 token 行读取
+
+召回以 token 在该请求序列中的位置为索引。稳态 Decode 时，Top‑K 命中 HBM 的行直接复用；对缺失的行，vLLM-Ascend 给出配对的源 token 位置和目标热槽。一批召回可以包含多个离散位置，每个位置只取当前层的一行 CKV 和一行 KPE。[缺失位置与目标槽](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/csrc/attention/fused_lightning_indexer_manage/README.md#L89-L96)
+
+### 4. 在 NPU 上计算 DDR 地址
+
+NPU 可直接访问当前层的分量基址和 HBM 中的请求块表。给定请求内 token 位置 `p` 和每块 token 数 `B`，只需一次块表索引，随后用相同的行号计算 CKV、KPE 两个地址。请求按 block 保存映射，逐 token 召回无需向 Host 查询对象 key。[设备侧块表](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/attention/sfa_kv_offload.py#L402-L407) · [算子寻址](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/csrc/attention/fused_scatter_copy_sparse_flash_attention/op_kernel/first_fill_scatter_copy_kernel.h#L142-L180)
+
+```text
+物理块号 = 请求块表[p // B]
+物理行号 = 物理块号 × B + p % B
+CKV 源地址 = CKV_base[layer] + 物理行号 × CKV 每行字节数
+KPE 源地址 = KPE_base[layer] + 物理行号 × KPE 每行字节数
+```
+
+### 5. 单个 token 召回产生两个小读区间
+
+GLM‑5.3 的 CKV 为 512 维，KPE 为 64 维。下表按一个 token 在一层的有效数据量计算。当前实现要求主 KV 使用 BF16；FP8 一行用于估算两个分量都按 1 字节存储时的读粒度，量化 scale 另计。表中的两段对应两个源地址区间，实际链路包数取决于传输实现。[GLM‑5.3 配置](https://huggingface.co/zai-org/GLM-5.3/raw/main/config.json) · [BF16 类型检查](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py#L815-L828) · [两次分量读取](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/csrc/attention/fused_scatter_copy_sparse_flash_attention/op_kernel/first_fill_scatter_copy_kernel.h#L183-L193)
+
+| 主 KV 精度 | CKV 读区间 | KPE 读区间 | 单层、单 token 合计 |
+| --- | ---: | ---: | ---: |
+| BF16（当前实现） | 1024 B | 128 B | 1152 B |
+| FP8（估算） | 512 B | 64 B | 576 B |
