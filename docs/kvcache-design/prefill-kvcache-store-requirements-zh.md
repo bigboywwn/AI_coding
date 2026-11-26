@@ -23,6 +23,24 @@
 
 例如 Decode 为请求的某个逻辑块分配物理块号 `37`，这一个表项就确定了它在各层 CKV、KPE 区域中的第 37 块。若各层独立分配块号，同一逻辑块在各层可能对应不同物理块号，请求块表就需要额外记录这一层映射。[Prefill 对象内偏移](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/layerwise/kv_transfer.py#L447-L475) · [Decode 各层基址](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py#L892-L928) · [设备侧块表寻址](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/csrc/attention/fused_scatter_copy_sparse_flash_attention/op_kernel/first_fill_scatter_copy_kernel.h#L142-L180)
 
+## Prefill 与 Decode DSA 的读写方式差异
+
+| 操作 | Prefill | Decode DSA（默认 `fused_copy_sfa` 路径） |
+| --- | --- | --- |
+| 写入 Store | 按 key 写。一个 key 标识一个多 token 块在同一 cache group 内聚合的 KV。block-wise 一次写完整对象，layer-wise 按同一 key 和对象内字节区间逐层写入。 | 按请求的完整 token 块写回。尾块满足写回条件后，查请求块表得到 DDR 目标块号，每层写出该块的 CKV、KPE，多层可合并提交。 |
+| 从 Store 读取 | 按 key 读。block-wise 读回对象包含的全部层，layer-wise 通过 `key + offset + length` 只读当前层的区间。 | 按当前层和 token 在请求序列中的位置读。稳态 Top‑K 查询仅召回 HBM 缺失的行，每行填入指定热槽，一次调用可包含多个离散位置。 |
+
+## Prefill 与 Decode DSA 的 I/O 粒度差异
+
+以 GLM‑5.3 的一层为例，CKV 每个 token 有 512 个元素，KPE 有 64 个。Prefill 按层搬运一个完整的 128-token 块时，各分量在块内聚合。Decode DSA 一次 miss 只需取回同层一个 token 的两个分量。下表按两个源区间分别列出有效字节数。[模型配置](https://huggingface.co/zai-org/GLM-5.3/raw/main/config.json) · [按层区间计算](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/layerwise/kv_transfer.py#L447-L475) · [Decode 分量读取](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/csrc/attention/fused_scatter_copy_sparse_flash_attention/op_kernel/first_fill_scatter_copy_kernel.h#L183-L193)
+
+| 主 KV 精度 | Prefill 单层完整块，128 个 token（CKV + KPE） | Decode 单层一次 miss，1 个 token（CKV + KPE） |
+| --- | ---: | ---: |
+| BF16（当前 Decode 实现） | 128 KiB + 16 KiB | 1024 B + 128 B |
+| FP8（按每元素 1 B 估算，量化 scale 另计） | 64 KiB + 8 KiB | 512 B + 64 B |
+
+128 个 token 是本例的完整块大小，部分块或较短的 range 可产生更小的 Prefill I/O。Decode 需要支持小于 1 KiB 的离散读区间，例如 BF16 的 KPE 为 128 B，同次召回的 CKV 恰为 1 KiB。实际链路分包由传输实现决定。
+
 ## Prefill KVCache Store
 
 以 vLLM-Ascend 对接社区 Mooncake Store 为例。Prefill 写出时，将已生成的 KV 从本地 HBM 存到指定 key。前缀命中时，将该 key 对应的 KV 读回本次请求使用的 HBM 位置。
