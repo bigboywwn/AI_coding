@@ -13,6 +13,16 @@
 
 实现依据见 [Prefill 块寻址](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py#L477-L515)、[Decode 热缓存与尾块分配](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py#L114-L159) 和 [Decode 稳态命中与替换](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/csrc/attention/fused_lightning_indexer_manage/README.md#L89-L96)。
 
+## Prefill 与 Decode DSA 的 Store 空间布局差异
+
+| 比较项 | Prefill（DDR 或 SSD 中的前缀对象） | Decode DSA（DDR 中的请求历史） |
+| --- | --- | --- |
+| 数据怎样排布 | 同一个 token block 在同一 cache group 内各兼容注意力层的 KV 聚合成一个对象。各层、各分量占据约定的对象内字节区间。 | DDR 按层、按分量划分区域。每层分别保存所有物理块的 CKV 和 KPE，同一 cache group 的各层共用一套物理块号。 |
+| 需要哪些元数据 | 多层共用一个对象 key，Store 只需为聚合对象维护目录项。调用方根据布局计算层和分量的对象内偏移。 | 每个请求维护逻辑块号到物理块号的块表，每层维护 CKV、KPE 基址。NPU 可直接使用 HBM 中的块表和基址计算 DDR 行地址。 |
+| 布局怎样服务读写 | block-wise 按 key 读写整个对象；layer-wise 沿用同一 key，以偏移和长度读写当前层的区间。SSD 的实际 I/O 粒度由后端决定。 | 按层定位数据，写回可跨层批量提交完整块，召回可在当前层批量读取离散 token 行。 |
+
+例如 Decode 为请求的某个逻辑块分配物理块号 `37`，这一个表项就确定了它在各层 CKV、KPE 区域中的第 37 块。若各层独立分配块号，同一逻辑块在各层可能对应不同物理块号，请求块表就需要额外记录这一层映射。[Prefill 对象内偏移](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/layerwise/kv_transfer.py#L447-L475) · [Decode 各层基址](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py#L892-L928) · [设备侧块表寻址](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/csrc/attention/fused_scatter_copy_sparse_flash_attention/op_kernel/first_fill_scatter_copy_kernel.h#L142-L180)
+
 ## Prefill KVCache Store
 
 以 vLLM-Ascend 对接社区 Mooncake Store 为例。Prefill 写出时，将已生成的 KV 从本地 HBM 存到指定 key。前缀命中时，将该 key 对应的 KV 读回本次请求使用的 HBM 位置。
