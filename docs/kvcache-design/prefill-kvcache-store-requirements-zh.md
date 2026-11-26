@@ -1,5 +1,18 @@
 # Prefill 与 Decode DSA Offload 的 KVCache Store 原始需求
 
+## Prefill 与 Decode DSA 的 HBM 驻留差异
+
+两条路径都按层、按 KV 分量确定 HBM 基址。差异在于当前层需要保留哪些 token、按什么粒度判断命中，以及 Store 读回时要填入哪些位置。
+
+| 比较项 | Prefill（以全注意力、chunked prefill 为例） | Decode DSA（默认 `fused_copy_sfa` 路径） |
+| --- | --- | --- |
+| 每个请求在当前层的 KV | 计算当前 chunk 时，HBM 中需要有命中前缀的 KV、此前各 chunk 已算出的 KV，以及当前 chunk 新生成的 KV。 | HBM 中保留可跨 step 复用的历史热 KV，以及存放近期新 KV 的两个轮转尾块。热槽容量可以大于单步 Top‑K，例如每步选 2K 个 token，预留 8K 个热槽。 |
+| 命中与复用粒度 | 以 block 查询前缀命中。块就绪后，Attention 直接按块内偏移访问所需 token。 | 稳态下对选中的历史 token 逐个判断驻留。命中时沿用原热槽，miss 时选择可替换槽，更新“请求内 token 位置 → 热槽”的映射。 |
+| HBM 寻址 | 由当前层分量基址、本地 `block_id` 和块内偏移计算地址。启用层间共享槽时，不同层可在不同时刻复用同一基址。 | 由当前层分量基址、热槽和 HBM 块表定位物理行。两个尾块按序列进度轮转。 |
+| Store 读回的目标 | 调用方按 key 指定本地 HBM 块对应的地址区间。block-wise 填整个块对象，layer-wise 填当前层的区间。 | vLLM-Ascend 在设备侧完成命中判断与逐出，为每个 miss 指定目标热槽。一次可将多个离散 token 行分别填入对应热槽。 |
+
+实现依据见 [Prefill 块寻址](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py#L477-L515)、[Decode 热缓存与尾块分配](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/vllm_ascend/distributed/kv_transfer/sparse_kv_offload/sparse_kv_offload_manager.py#L114-L159) 和 [Decode 稳态命中与替换](https://github.com/vllm-project/vllm-ascend/blob/09317fc13a3daf2acb44e60dcb4b2ba877c24eca/csrc/attention/fused_lightning_indexer_manage/README.md#L89-L96)。
+
 ## Prefill KVCache Store
 
 以 vLLM-Ascend 对接社区 Mooncake Store 为例。Prefill 写出时，将已生成的 KV 从本地 HBM 存到指定 key。前缀命中时，将该 key 对应的 KV 读回本次请求使用的 HBM 位置。
