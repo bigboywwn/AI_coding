@@ -13,7 +13,7 @@ Prefill 的前缀块可供多个请求反复读取。Decode 的历史 KV 属于�
 | 谁分配空间 | Master 选存储节点和介质，Server 为前缀块分配空间 | Server 预留一段 DDR，Client 从中为请求分配块 | Server 预留一段 DDR，Client 从中按张量大小分配空间 | Server 为每个权重表分片分配连续空间 |
 | 谁管元数据 | Master 管 key 目录，Client 记录本次读写使用的对象位置 | Client 管请求块表和可读历史边界，DSA 管热槽 | Client 管本 rank 的激活句柄，OpReplay 记录每次算子调用对应的句柄 | 加载器发布版本目录，Client 保存所用版本的分片信息 |
 | 读时查询的信息存在哪里 | key 目录在 Master 的 Host DDR，本次读写使用的对象位置在 Client 的 Host DDR | 请求块表、各层基址和可读历史边界在 HBM | 句柄表在计算节点 Host DDR | 分片的行号范围、基址和行宽在 HBM |
-| 发起传输的位置 | 计算节点 Host CPU；读盘请求由 SSD 节点 CPU 发起 | 计算节点 NPU | 计算节点 Host CPU | 计算节点 NPU |
+| 发起传输的位置 | 读写均由计算节点 Host CPU 发起；NVMe 读写由 SSD 节点 CPU 提交 | 按方案，整块写入和离散读取均由计算节点 NPU 发起 | 换出和预取均由计算节点 Host CPU 发起 | 加载时由计算节点 Host CPU 写入，推理时由计算节点 NPU 读取 |
 
 **RH2D** 指从远端内存节点的 DDR 读到计算节点的 HBM。Server 先向网卡注册内存，并允许 Client 访问指定范围。目标 NPU 可以直接发起离散 RH2D。Decode 和 Engram 采用这种方式；训练由 Host CPU 发起传输，数据同样可以直接读到 HBM。
 
@@ -25,7 +25,7 @@ Prefill 的前缀块可供多个请求反复读取。Decode 的历史 KV 属于�
 | 访问标识 | 一个 key 对应一个 token 块在同组各层的 KV。block-wise 按 key 读写整个对象。layer-wise 沿用同一个 key，另外指定本层数据在对象内的偏移和长度。 |
 | 空间分配 | 首次写入时，Master 选择 DDR 或 SSD 以及存储节点，Server 按整个对象的大小预留空间。逐层写入时，各层用各自的偏移写入这块空间。 |
 | 读时寻址 | Master 按 key 找到已发布的对象。Client 在本次读取期间沿用这个位置，加上层和分量对应的偏移，就能找到要读的数据。 |
-| 调用机制 | vLLM worker 在进程内调用 Client。Client 通过批量 RPC 向 Master 申请写入、提交写好的对象或申请读取。需要读盘时，由 SSD Server 提交 NVMe 读请求。 |
+| 调用机制 | **写入。** vLLM worker 在进程内调用 Client，传入 key 和 HBM 源区间。Client 通过 RPC 向 Master 预留对象，再向 Transport 提交整块或逐层写入。写到 SSD 时，由 SSD Server 提交 NVMe 写请求。整个对象写完后，Client 通知 Master 发布该 key。<br>**读取。** worker 在进程内调用 Client，传入 key 和 HBM 目标区间。Client 通过批量 RPC 向 Master 查询对象位置，再向 Transport 提交整块或逐层读取。命中 SSD 时，由 SSD Server 先提交 NVMe 读请求。逐层读写时，worker 还要传本层在对象内的偏移。 |
 | 数据路径 | 命中远端 DDR 时，数据从 DDR 读入 HBM。命中 SSD 时，先从 SSD 读入已注册的 DDR 缓冲，再传入 HBM。写入时沿相应路径反向传输。 |
 | I/O 粒度 | block-wise 一次读写整个前缀块对象。以 GLM‑5.3、BF16、128-token 块为例，layer-wise 读一层时，CKV 是一个 128 KiB 区间，KPE 是另一个 16 KiB 区间。 |
 | 可读条件 | 写入方把这个 key 对应的各层 KV 全部写完并提交后，其他请求就能按 key 命中。命中后，等本层要用的 KV 传入本地 HBM，本层 Attention 就可以读取。 |
@@ -39,9 +39,9 @@ Prefill 的前缀块可供多个请求反复读取。Decode 的历史 KV 属于�
 | --- | --- |
 | 业务边界 | DSA 选择 Top‑K，判断哪些 token 已在热槽中，并为缺失的 token 选好目标热槽。Store 管远端历史 KV 的空间和地址，负责 KV 在 HBM 与远端 DDR 之间的复制传输。 |
 | 访问标识 | 写入时，DSA 提供请求、层、逻辑块号和尾块的 HBM 源地址。读回时，DSA 提供请求、层、缺失 token 在序列中的位置，以及每个 token 对应的 HBM 目标地址。相同位置只需取一次。 |
-| 空间分配 | Server 提前为 Client 预留一段远端 DDR。NPU 上的 Client 从中为请求分配物理块号，同组各层共用这个块号。如果预留空间用完，Client 等待补充空间或返回容量不足。 |
+| 空间分配 | 准备阶段，计算节点的 Host CPU 通过 RPC 向 Server 申请远端 DDR，取得地址范围和访问权限。NPU 上的 Client 从中为请求分配物理块号，同组各层共用这个块号。如果预留空间用完，Client 等待补充空间或返回容量不足。 |
 | 读时寻址 | Client 先确认 token 位于已经写好的历史范围内，再用请求块表把逻辑块号换成物理块号。结合本层各分量的基址和 token 在块内的位置，Client 就能算出各分量的远端地址。 |
-| 调用机制 | 准备阶段，计算节点的 Host CPU 通过 RPC 向 Server 申请远端 DDR，并取得地址范围和访问权限。每层召回时，DSA 在 NPU 上把缺失 token 的位置和对应的 HBM 目标地址传给 Client。Client 直接在 NPU 上查块表并发起离散 RH2D。 |
+| 调用机制 | **写入。** 尾块写满后，DSA 在 NPU 上调用 Client，传入请求、层、逻辑块号和尾块的 HBM 源区间。Client 在预留空间内分配或查找远端块号，再向 Transport 提交本层整块写入。<br>**读取。** DSA 在 NPU 上调用 Client，传入请求、层、缺失 token 的位置和对应的 HBM 目标地址。Client 查块表算出远端源地址，直接在 NPU 上发起离散 RH2D。 |
 | 数据路径 | 写入时，从 HBM 尾块传到远端 DDR。读回时，从远端 DDR 传到 DSA 指定的 HBM 热槽。 |
 | I/O 粒度 | 写入按单层完整块，例如 128 个 token。读取按单个请求、单步、单层中实际缺失的 M 个 token 计算。656 B 打包格式读 M 个离散源地址，每址 656 B。若 512 B CKV 和 64 B KPE 紧邻且无额外字段，则读 M 个离散源地址，每址 576 B。若分开存放，则读 M 个 CKV 地址，每址 512 B，另读 M 个 KPE 地址，每址 64 B。当前 vLLM-Ascend BF16 分存示例的每址长度分别为 1024 B 和 128 B。 |
 | 可读条件 | 下一个完整块的各层 KV 分量都写入远端 DDR 后，Client 把该块加入可读历史范围。读回时，若传输与 Attention 融合，每组 KV 所需的分量到齐就可以计算这一组。若分开执行，等本次 Attention 所需的全部缺失行到齐再计算。 |
@@ -55,9 +55,9 @@ Prefill 的前缀块可供多个请求反复读取。Decode 的历史 KV 属于�
 | --- | --- |
 | 业务边界 | OpReplay 决定保存哪次算子调用的输出、什么时候重新计算、什么时候使用激活。Client 管理激活的位置，根据使用顺序和可用 HBM 安排写出和预取。 |
 | 访问标识 | OpReplay 登记前向算子的输出张量，取得一个激活句柄。激活换了存放位置，OpReplay 仍用这个句柄取回它。 |
-| 空间分配 | Server 为每个训练 rank 的 Client 预留一段远端 DDR。只有实际写出激活时，Client 才按要传输的张量大小分配空间。 |
+| 空间分配 | 每个训练 rank 的 Client 通过 RPC 向 Server 预留一段远端 DDR。只有实际写出激活时，Client 才按要传输的张量大小分配空间。 |
 | 读时寻址 | Client 按句柄查本 rank 的句柄表。若 HBM 中还有可用的激活，就直接使用；若需要从远端读回，就按表中记录的基址、偏移和长度读取，再按记录的张量布局交给算子。 |
-| 调用机制 | OpReplay 在训练进程内调用 Client。Client 通过 RPC 向 Server 申请远端 DDR。写出或预取时，由计算节点的 Host CPU 向 Transport 提交请求。 |
+| 调用机制 | **写入。** OpReplay 在训练进程内把张量交给 Client，取得句柄。需要换出时，Client 按张量大小分配远端空间，在 Host CPU 上将 HBM 源地址、远端目标地址和长度提交给 Transport。<br>**读取。** OpReplay 在同一进程内按句柄请求预取或取回激活。Client 查句柄表。若激活仍在 HBM，就直接使用；若在远端，Client 在 Host CPU 上向 Transport 提交远端源地址、HBM 目标地址和长度。 |
 | 数据路径 | 写出时，从 HBM 传到远端 DDR。预取时，从远端 DDR 传回 HBM。 |
 | I/O 粒度 | 每次传输一个 rank 上的一份张量数据。例如连续 BF16 张量 `[1, 4096, 4096]`，写出或读回一次都是一个 32 MiB 区间。 |
 | 可读条件 | OpReplay 拿到句柄时，激活可能仍在 HBM，可以直接用于重计算。写出成功后才能从远端读取。需要预取时，等所需张量传回 HBM，算子就可以使用。 |
@@ -73,7 +73,7 @@ Prefill 的前缀块可供多个请求反复读取。Decode 的历史 KV 属于�
 | 访问标识 | 加载器按模型版本、层和分片写入权重。推理时，模型指定已选定的版本、层、行号和每行对应的 HBM 目标位置。 |
 | 空间分配 | 加载模型时，Server 为每个权重表分片分配一段连续空间。后续查询这一版本时，直接使用已分配的空间。 |
 | 读时寻址 | Client 按行号找到对应分片。远端源地址等于该分片的基址加上分片内行号乘以行宽。 |
-| 调用机制 | 加载器在计算节点的 Host CPU 上通过 RPC 向 Server 申请分片空间。推理实例选定版本时取得各分片的行号范围、基址和行宽。推理时，模型在 NPU 上把行号和目标位置传给 Client，由 Client 发起离散 RH2D。 |
+| 调用机制 | **写入。** 模型加载时，加载器在 Host CPU 上通过 RPC 向 Server 申请指定版本、层和分片的空间，再把权重源区间和远端目标区间提交给 Transport。该版本的所有分片写完后，加载器发布版本目录。<br>**读取。** 推理实例先绑定版本并取得分片信息。推理时，模型在 NPU 上调用 Client，传入层、行号列表和各行的 HBM 目标位置。Client 根据分片信息算出远端源地址，在 NPU 上发起离散 RH2D。 |
 | 数据路径 | 加载时，将权重传到远端 DDR。推理时，各 rank 所需的行从远端 DDR 传到本 rank 的 HBM。 |
 | I/O 粒度 | 加载时按分片写入。DS‑V4.1‑Flash 推理时，每个有效文本 token、每个 Engram 层读取 **24 个离散源地址，每址 264 B**。24 是该层全部哈希 head 的读取数。 |
 | 可读条件 | 加载器把一个版本的所有分片写完并发布后，推理实例就可以使用该版本。若读权重与计算融合，一组所需的行到齐就计算这一组。若分开执行，等本次计算所需的行全部到齐再开始。需要跨组或跨 rank 汇合的步骤，要等相应结果到齐。 |
